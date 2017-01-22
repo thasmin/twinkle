@@ -49,6 +49,7 @@ public:
 	bool has_audio();
 	AVStream* get_video_stream();
 	AVStream* get_audio_stream();
+	AVCodecContext* get_video_context();
 	AVCodecContext* get_audio_context();
 
 protected:

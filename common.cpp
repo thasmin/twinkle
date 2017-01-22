@@ -356,6 +356,10 @@ AVStream* Decoder_Ctx::get_audio_stream() {
 	return this->format_ctx->streams[this->audio_stream_index];
 }
 
+AVCodecContext* Decoder_Ctx::get_video_context() {
+	return this->video_decoder_ctx;
+}
+
 AVCodecContext* Decoder_Ctx::get_audio_context() {
 	return this->audio_decoder_ctx;
 }

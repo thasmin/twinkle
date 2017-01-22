@@ -15,7 +15,10 @@
 #include <SDL2/SDL.h>
 #include <SDL2/SDL_opengl.h>
 extern "C" {
-#include "libswresample/swresample.h"
+#include <libswresample/swresample.h>
+#include <libavfilter/avfiltergraph.h>
+#include <libavfilter/buffersink.h>
+#include <libavfilter/buffersrc.h>
 }
 
 #define NK_INCLUDE_FIXED_TYPES
@@ -47,6 +50,14 @@ SwsContext* sws_ctx;
 AVFrame* rgb_frame;
 FrameClock* video_clock = nullptr;
 FrameClock* audio_clock = nullptr;
+
+// filter graph data
+const char *filter_str = "drawbox=x=10:y=10:w=200:h=200:color=blue:t=10";
+//const char *filter_str = "fade=t=out:st=1,fade=t=in:st=2"; // doesn't work because the fade in sets beginning to black, fade out sets end as black, so it's all black
+//const char *filter_str = "fade=t=in:st=1,fade=t=out:st=2"; // works
+AVFilterContext *buffersink_ctx = nullptr;
+AVFilterContext *buffersrc_ctx = nullptr;
+AVFilterGraph *filter_graph = nullptr;
 
 const char* input_file = "countdown.mp4";
 
@@ -122,15 +133,85 @@ void play_pause() {
 	paused ? play() : pause();
 }
 
+int init_filters(const char* filters_descr, AVCodecContext* dec_ctx, AVStream* video_stream) {
+	int ret = 0;
+
+    AVFilter *buffersrc  = avfilter_get_by_name("buffer");
+    AVFilter *buffersink = avfilter_get_by_name("buffersink");
+    AVFilterInOut *outputs = avfilter_inout_alloc();
+    AVFilterInOut *inputs  = avfilter_inout_alloc();
+    AVRational time_base = video_stream->time_base;
+
+    filter_graph = avfilter_graph_alloc();
+    if (!outputs || !inputs || !filter_graph) {
+        ret = AVERROR(ENOMEM);
+        goto end;
+    }
+
+    // buffer video source: the decoded frames from the decoder will be inserted here.
+	char args[512];
+    snprintf(args, sizeof(args),
+            "video_size=%dx%d:pix_fmt=%d:time_base=%d/%d:pixel_aspect=%d/%d",
+            dec_ctx->width, dec_ctx->height, dec_ctx->pix_fmt,
+            time_base.num, time_base.den,
+            dec_ctx->sample_aspect_ratio.num, dec_ctx->sample_aspect_ratio.den);
+
+    ret = avfilter_graph_create_filter(&buffersrc_ctx, buffersrc, "in", args, NULL, filter_graph);
+    if (ret < 0) {
+        printf("Cannot create buffer source: %s\n", av_err2str(ret));
+        goto end;
+    }
+
+    // buffer video sink: to terminate the filter chain.
+    ret = avfilter_graph_create_filter(&buffersink_ctx, buffersink, "out", NULL, NULL, filter_graph);
+    if (ret < 0) {
+        printf("Cannot create buffer sink: %s\n", av_err2str(ret));
+        goto end;
+    }
+
+    // Set the endpoints for the filter graph. The filter_graph will be linked to the graph described by filters_descr.
+
+    // The buffer source output must be connected to the input pad of the first filter described by filters_descr
+	// since the first filter input label is not specified, it is set to "in" by default.
+    outputs->name       = av_strdup("in");
+    outputs->filter_ctx = buffersrc_ctx;
+    outputs->pad_idx    = 0;
+    outputs->next       = NULL;
+
+    // The buffer sink input must be connected to the output pad of the last filter described by filters_descr
+	// since the last filter output label is not specified, it is set to "out" by default.
+    inputs->name       = av_strdup("out");
+    inputs->filter_ctx = buffersink_ctx;
+    inputs->pad_idx    = 0;
+    inputs->next       = NULL;
+
+    if ((ret = avfilter_graph_parse_ptr(filter_graph, filters_descr, &inputs, &outputs, NULL)) < 0)
+        goto end;
+
+    if ((ret = avfilter_graph_config(filter_graph, NULL)) < 0)
+        goto end;
+
+end:
+    avfilter_inout_free(&inputs);
+    avfilter_inout_free(&outputs);
+
+    return ret;
+}
+
 int main(int argc, char* argv[]) {
 	// video decoder
 	av_register_all();
+	avfilter_register_all();
+
 	if (decoder.open_file(input_file) != 0)
 		exit(1);
 	SDL_Delay(10);
 
-	if (decoder.has_video())
+	if (decoder.has_video()) {
 		video_clock = new FrameClock(decoder.get_video_stream()->time_base);
+		// filter graph
+		init_filters(filter_str, decoder.get_video_context(), decoder.get_video_stream());
+	}
 
 	if (decoder.has_audio()) {
 		audio_clock = new FrameClock(decoder.get_audio_stream()->time_base);
@@ -222,19 +303,37 @@ int main(int argc, char* argv[]) {
 		if (decoder.has_video() && (just_seeked || !paused)) {
 			just_seeked = false;
 			// decode a video frame
+			// decoded_frame is unreffed by decoder
 			AVFrame* decoded_frame = decoder.get_video_frame();
+			AVFrame* filtered_frame = av_frame_alloc();
 			if (decoded_frame != nullptr && decoded_frame->width != 0 && decoded_frame->height != 0) {
 				video_frame_pts = decoded_frame->pts;
+
+				if (av_buffersrc_add_frame_flags(buffersrc_ctx, decoded_frame, AV_BUFFERSRC_FLAG_KEEP_REF) < 0) {
+                    printf("Error while feeding the filtergraph\n");
+                    break;
+                }
+
+				// filtergraph could contain multiple frames from one?
+				while (true) {
+					int ret = av_buffersink_get_frame(buffersink_ctx, filtered_frame);
+					if (ret == AVERROR(EAGAIN) || ret == AVERROR_EOF)
+                        break;
+					if (ret < 0)
+						printf("Error while retrieving from the filter graph: %s\n", av_err2str(ret));
+				}
 
 				if (sws_ctx == nullptr) {
 					sws_ctx = sws_getContext(decoded_frame->width, decoded_frame->height, (enum AVPixelFormat) decoded_frame->format,
 							video_w, video_h, AV_PIX_FMT_RGB24,
 							SWS_BICUBIC, NULL, NULL, NULL);
+					// rgb_frame is reused and unreffed at end of program
 					rgb_frame = av_frame_alloc();
 					av_image_alloc(rgb_frame->data, rgb_frame->linesize, video_w, video_h, AV_PIX_FMT_RGB24, 1);
 				}
 
-				sws_scale(sws_ctx, decoded_frame->data, decoded_frame->linesize, 0, decoded_frame->height, rgb_frame->data, rgb_frame->linesize);
+				sws_scale(sws_ctx, filtered_frame->data, filtered_frame->linesize, 0, filtered_frame->height, rgb_frame->data, rgb_frame->linesize);
+				av_frame_unref(filtered_frame);
 
 				glBindTexture(GL_TEXTURE_2D, frame_texture);
 				glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, video_w, video_h, GL_RGB, GL_UNSIGNED_BYTE, rgb_frame->data[0]);
@@ -311,6 +410,7 @@ int main(int argc, char* argv[]) {
 cleanup:
 	quit = true;
 
+	avfilter_graph_free(&filter_graph);
 	av_frame_free(&rgb_frame);
 	sws_freeContext(sws_ctx);
 
