@@ -1,14 +1,3 @@
-#include <stdio.h>
-#include <stdlib.h>
-#include <stdint.h>
-#include <stdarg.h>
-#include <string.h>
-#include <math.h>
-#include <assert.h>
-#include <math.h>
-#include <limits.h>
-#include <time.h>
-
 #include <vector>
 #include <list>
 #include <string>
@@ -59,11 +48,6 @@ SwsContext* sws_ctx;
 AVFrame* rgb_frame;
 FrameClock* video_clock = nullptr;
 FrameClock* audio_clock = nullptr;
-
-// filter graph data
-//const char *filter_str = "drawbox=x=10:y=10:w=200:h=200:color=blue:t=10";
-//const char *filter_str = "fade=t=out:st=1,fade=t=in:st=2"; // doesn't work because the fade in sets beginning to black, fade out sets end as black, so it's all black
-//const char *filter_str = "fade=t=in:st=1,fade=t=out:st=2"; // works
 
 std::list<Clip> clips;
 
@@ -262,7 +246,7 @@ void split_clip()
 	if (clip_it == clips.end())
 		return;
 
-	Clip to_add = Clip(clip_it->decoder, clips_bar_last_click_secs, clip_it->duration_secs + clip_it->start_secs - clips_bar_last_click_secs);
+	Clip to_add = Clip(clips_bar_last_click_secs, clip_it->duration_secs + clip_it->start_secs - clips_bar_last_click_secs);
 	clip_it->duration_secs = clips_bar_last_click_secs - clip_it->start_secs;
 	clips.insert(++clip_it, to_add);
 }
@@ -281,7 +265,7 @@ int main(int argc, char* argv[])
 		video_clock = new FrameClock(decoder.get_video_stream()->time_base);
 		//clips.push_back(Clip(&decoder, "fade=t=out:st=1", 0, 2));
 		//clips.push_back(Clip(&decoder, "fade=t=in:st=0", 2, av_q2d(decoder.get_video_stream()->time_base) * decoder.get_video_stream()->duration - 2));
-		clips.push_back(Clip(&decoder, 0, av_q2d(decoder.get_video_stream()->time_base) * decoder.get_video_stream()->duration));
+		clips.push_back(Clip(0, av_q2d(decoder.get_video_stream()->time_base) * decoder.get_video_stream()->duration));
 	}
 
 	if (decoder.has_audio()) {

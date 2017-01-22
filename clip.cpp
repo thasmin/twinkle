@@ -1,53 +1,31 @@
 #include "clip.h"
 
-Clip::Clip(Decoder_Ctx* decoder, std::string filters_descr, double start_secs, double duration_secs)
+Filter::Filter(Decoder_Ctx* decoder, std::string descr)
 {
 	this->decoder = decoder;
-	this->start_secs = start_secs;
-	this->duration_secs = duration_secs;
-	this->filters_descr = filters_descr;
-
+	this->descr = descr;
 	this->output_frame = av_frame_alloc();
 }
 
-Clip::Clip(Decoder_Ctx* decoder, double start_secs, double duration_secs)
-{
-	this->decoder = decoder;
-	this->start_secs = start_secs;
-	this->duration_secs = duration_secs;
-
-	this->output_frame = av_frame_alloc();
-}
-
-
-Clip::~Clip()
+Filter::~Filter()
 {
 	av_frame_unref(this->output_frame);
 	if (filter_graph != nullptr)
 		avfilter_graph_free(&this->filter_graph);
 }
 
-void Clip::set_filter_descr(std::string descr)
-{
-	this->filters_descr = filters_descr;
-
-	if (filter_graph != nullptr)
-		avfilter_graph_free(&this->filter_graph);
-	filter_graph = nullptr;
-}
-
-AVFrame* Clip::get_output_frame()
+AVFrame* Filter::get_output_frame()
 {
 	return this->output_frame;
 }
 
-int Clip::feed(AVFrame* in_frame)
+int Filter::feed(AVFrame* in_frame)
 {
 	int ret;
 
 	// if no filter then just copy frame
 	// otherwise make sure filters are initialized
-	if (filters_descr.empty()) {
+	if (descr.empty()) {
 		av_frame_ref(this->output_frame, in_frame);
 		return 0;
 	} else if (this->filter_graph == nullptr) {
@@ -75,7 +53,7 @@ int Clip::feed(AVFrame* in_frame)
 	return 0;
 }
 
-int Clip::init_filters()
+int Filter::init_filters()
 {
 	int ret = 0;
 
@@ -115,23 +93,23 @@ int Clip::init_filters()
         goto end;
     }
 
-    // Set the endpoints for the filter graph. The filter_graph will be linked to the graph described by filters_descr.
+    // Set the endpoints for the filter graph. The filter_graph will be linked to the graph described by filter descr.
 
-    // The buffer source output must be connected to the input pad of the first filter described by filters_descr
+    // The buffer source output must be connected to the input pad of the first filter described by filter descr
 	// since the first filter input label is not specified, it is set to "in" by default.
     outputs->name       = av_strdup("in");
     outputs->filter_ctx = buffersrc_ctx;
     outputs->pad_idx    = 0;
     outputs->next       = NULL;
 
-    // The buffer sink input must be connected to the output pad of the last filter described by filters_descr
+    // The buffer sink input must be connected to the output pad of the last filter described by filter descr
 	// since the last filter output label is not specified, it is set to "out" by default.
     inputs->name       = av_strdup("out");
     inputs->filter_ctx = buffersink_ctx;
     inputs->pad_idx    = 0;
     inputs->next       = NULL;
 
-    if ((ret = avfilter_graph_parse_ptr(filter_graph, filters_descr.c_str(), &inputs, &outputs, NULL)) < 0)
+    if ((ret = avfilter_graph_parse_ptr(filter_graph, descr.c_str(), &inputs, &outputs, NULL)) < 0)
         goto end;
 
     if ((ret = avfilter_graph_config(filter_graph, NULL)) < 0)
@@ -144,3 +122,45 @@ end:
     return ret;
 }
 
+Clip::Clip(double start_secs, double duration_secs)
+{
+	this->start_secs = start_secs;
+	this->duration_secs = duration_secs;
+	this->output_frame = av_frame_alloc();
+}
+
+Clip::Clip(double start_secs, double duration_secs, Decoder_Ctx* decoder, enum FilterEffect effect)
+{
+	this->start_secs = start_secs;
+	this->duration_secs = duration_secs;
+	this->output_frame = av_frame_alloc();
+	switch (effect) {
+		case FadeOut: filter = Filter::FadeOut(decoder, duration_secs); break;
+		case FadeIn: filter = Filter::FadeIn(decoder, duration_secs); break;
+		default: filter = nullptr;
+	}
+}
+
+Clip::~Clip()
+{
+	av_frame_unref(this->output_frame);
+	delete filter;
+}
+
+int Clip::feed(AVFrame* in_frame)
+{
+	if (this->filter == nullptr) {
+		av_frame_ref(this->output_frame, in_frame);
+		return 0;
+	} else {
+		int ret = this->filter->feed(in_frame);
+		av_frame_unref(this->output_frame);
+		this->output_frame = this->filter->get_output_frame();
+		return ret;
+	}
+}
+
+AVFrame* Clip::get_output_frame()
+{
+	return this->output_frame;
+}
