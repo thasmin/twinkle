@@ -10,11 +10,13 @@
 #include <time.h>
 
 #include <vector>
+#include <string>
 
 #include <GL/glew.h>
 #include <SDL2/SDL.h>
 #include <SDL2/SDL_opengl.h>
-extern "C" {
+extern "C"
+{
 #include <libswresample/swresample.h>
 #include <libavfilter/avfiltergraph.h>
 #include <libavfilter/buffersink.h>
@@ -34,6 +36,7 @@ extern "C" {
 #include "nuklear_sdl_gl3.h"
 
 #include "common.h"
+#include "clip.h"
 
 #define WINDOW_WIDTH 800
 #define WINDOW_HEIGHT 600
@@ -42,8 +45,12 @@ extern "C" {
 #define MAX_ELEMENT_MEMORY 128 * 1024
 
 bool quit = false;
-bool paused = false;
-bool just_seeked = false;
+bool paused = true;
+float last_display_secs = 0;
+float last_seek_secs = -1;
+bool just_seeked = true;
+
+struct nk_font_atlas *atlas;
 
 Decoder_Ctx decoder;
 SwsContext* sws_ctx;
@@ -52,18 +59,18 @@ FrameClock* video_clock = nullptr;
 FrameClock* audio_clock = nullptr;
 
 // filter graph data
-const char *filter_str = "drawbox=x=10:y=10:w=200:h=200:color=blue:t=10";
+//const char *filter_str = "drawbox=x=10:y=10:w=200:h=200:color=blue:t=10";
 //const char *filter_str = "fade=t=out:st=1,fade=t=in:st=2"; // doesn't work because the fade in sets beginning to black, fade out sets end as black, so it's all black
 //const char *filter_str = "fade=t=in:st=1,fade=t=out:st=2"; // works
-AVFilterContext *buffersink_ctx = nullptr;
-AVFilterContext *buffersrc_ctx = nullptr;
-AVFilterGraph *filter_graph = nullptr;
+
+std::vector<Clip> clips;
 
 const char* input_file = "countdown.mp4";
 
 #define MAX_AUDIO_FRAME_SIZE 192000 // 1 second of 48khz 32bit audio
 
-void audio_callback(void*, Uint8 *stream, int len) {
+void audio_callback(void*, Uint8 *stream, int len)
+{
 	// unfreed memory
 	static uint8_t* audio_buf = (uint8_t*) av_malloc(MAX_AUDIO_FRAME_SIZE * 2);
 	static unsigned int audio_buf_size = 0;
@@ -118,87 +125,125 @@ void audio_callback(void*, Uint8 *stream, int len) {
 	}
 }
 
-void play() {
+void play()
+{
 	paused = false;
 	if (decoder.has_audio())
 		SDL_PauseAudio(0);
 }
 
-void pause() {
+void pause()
+{
 	paused = true;
 	SDL_PauseAudio(1);
 }
 
-void play_pause() {
+void play_pause()
+{
 	paused ? play() : pause();
 }
 
-int init_filters(const char* filters_descr, AVCodecContext* dec_ctx, AVStream* video_stream) {
-	int ret = 0;
+void seek(float seek_secs) {
+	if (last_seek_secs == seek_secs)
+		return;
 
-    AVFilter *buffersrc  = avfilter_get_by_name("buffer");
-    AVFilter *buffersink = avfilter_get_by_name("buffersink");
-    AVFilterInOut *outputs = avfilter_inout_alloc();
-    AVFilterInOut *inputs  = avfilter_inout_alloc();
-    AVRational time_base = video_stream->time_base;
-
-    filter_graph = avfilter_graph_alloc();
-    if (!outputs || !inputs || !filter_graph) {
-        ret = AVERROR(ENOMEM);
-        goto end;
-    }
-
-    // buffer video source: the decoded frames from the decoder will be inserted here.
-	char args[512];
-    snprintf(args, sizeof(args),
-            "video_size=%dx%d:pix_fmt=%d:time_base=%d/%d:pixel_aspect=%d/%d",
-            dec_ctx->width, dec_ctx->height, dec_ctx->pix_fmt,
-            time_base.num, time_base.den,
-            dec_ctx->sample_aspect_ratio.num, dec_ctx->sample_aspect_ratio.den);
-
-    ret = avfilter_graph_create_filter(&buffersrc_ctx, buffersrc, "in", args, NULL, filter_graph);
-    if (ret < 0) {
-        printf("Cannot create buffer source: %s\n", av_err2str(ret));
-        goto end;
-    }
-
-    // buffer video sink: to terminate the filter chain.
-    ret = avfilter_graph_create_filter(&buffersink_ctx, buffersink, "out", NULL, NULL, filter_graph);
-    if (ret < 0) {
-        printf("Cannot create buffer sink: %s\n", av_err2str(ret));
-        goto end;
-    }
-
-    // Set the endpoints for the filter graph. The filter_graph will be linked to the graph described by filters_descr.
-
-    // The buffer source output must be connected to the input pad of the first filter described by filters_descr
-	// since the first filter input label is not specified, it is set to "in" by default.
-    outputs->name       = av_strdup("in");
-    outputs->filter_ctx = buffersrc_ctx;
-    outputs->pad_idx    = 0;
-    outputs->next       = NULL;
-
-    // The buffer sink input must be connected to the output pad of the last filter described by filters_descr
-	// since the last filter output label is not specified, it is set to "out" by default.
-    inputs->name       = av_strdup("out");
-    inputs->filter_ctx = buffersink_ctx;
-    inputs->pad_idx    = 0;
-    inputs->next       = NULL;
-
-    if ((ret = avfilter_graph_parse_ptr(filter_graph, filters_descr, &inputs, &outputs, NULL)) < 0)
-        goto end;
-
-    if ((ret = avfilter_graph_config(filter_graph, NULL)) < 0)
-        goto end;
-
-end:
-    avfilter_inout_free(&inputs);
-    avfilter_inout_free(&outputs);
-
-    return ret;
+//printf("seeking to %.2f secs\n", seek_secs);
+	int seek_pts = decoder.seek(seek_secs);
+	if (video_clock != nullptr)
+		video_clock->ResetPTS(seek_pts);
+	last_seek_secs = seek_secs;
+	just_seeked = true;
 }
 
-int main(int argc, char* argv[]) {
+void widget_clips_bar(struct nk_context *ctx)
+{
+	struct nk_command_buffer *canvas = nk_window_get_canvas(ctx);
+
+	struct nk_rect space;
+	enum nk_widget_layout_states widget_state = nk_widget(&space, ctx);
+	if (!widget_state)
+		return;
+
+	float video_duration = av_q2d(decoder.get_video_stream()->time_base) * decoder.get_video_stream()->duration;
+	float pixels_per_sec = space.w / video_duration;
+	// color scheme from https://flatuicolors.com/
+	struct nk_color fill_colors[] = {
+		nk_rgb(192, 57, 43),
+		nk_rgb(211, 84, 0),
+		nk_rgb(243, 156, 18),
+		nk_rgb(39, 174, 96),
+		nk_rgb(41, 128, 185),
+		nk_rgb(142, 68, 173),
+		nk_rgb(44, 62, 80),
+		nk_rgb(127, 140, 141),
+		nk_rgb(189, 195, 199),
+	};
+	struct nk_color line_colors[] = {
+		nk_rgb(231, 76, 60),
+		nk_rgb(230, 126, 34),
+		nk_rgb(241, 196, 15),
+		nk_rgb(46, 204, 113),
+		nk_rgb(52, 152, 219),
+		nk_rgb(155, 89, 182),
+		nk_rgb(52, 73, 94),
+		nk_rgb(149, 165, 166),
+		nk_rgb(236, 240, 241),
+	};
+
+	// draw boxes for clips
+	int max_height = 28;
+	for (int i = 0; i < clips.size(); ++i) {
+		auto clip_it = clips.begin() + i;
+		float start = space.w * clip_it->start_secs / video_duration + 1; // add 1 for line thickness
+		float width = space.w * clip_it->duration_secs / video_duration - 10; // dunno why need to subtract 9
+		float height = max_height < space.h ? max_height : space.h;
+		struct nk_rect size = nk_rect(space.x + start, space.y + 1, space.x + width, height);
+		nk_fill_rect(canvas, size, 2, fill_colors[i]);
+		nk_stroke_rect(canvas, size, 2, 3, line_colors[i]);
+	}
+
+	// draw marks for each second
+	for (int i = 0; i < video_duration; ++i) {
+		struct nk_rect mark = nk_rect(space.x + space.w * i / video_duration, space.y + space.h - 10, 1, 10);
+		nk_stroke_rect(canvas, mark, 0, 1, nk_rgb(200,200,200));
+	}
+
+	// draw full time
+	char time[10];
+	int timelen = snprintf(time, 10, "%ds", (int) video_duration);
+	const struct nk_user_font* def_font = ctx->style.font;
+	int width = def_font->width(def_font->userdata, def_font->height, time, timelen);
+	int height = def_font->height;
+	struct nk_rect time_rect = nk_rect(space.x + space.w - width, space.y + space.h - height, width, height);
+	nk_draw_text(canvas, time_rect, time, timelen, def_font, nk_black, nk_rgb(200,200,200));
+
+	float mouse_x = ctx->input.mouse.pos.x;
+
+	// draw hover vertical line
+	if (nk_input_is_mouse_hovering_rect(&ctx->input, space))
+		nk_stroke_line(canvas, mouse_x, space.y, mouse_x, space.y + space.h, 1, nk_rgb(200,200,200));
+
+	// draw current place indicator
+	int current_x = space.w * last_display_secs / video_duration;
+	nk_stroke_line(canvas, current_x, space.y, current_x, space.y + space.h, 1, nk_rgb(100,100,100));
+
+	// handle seeks via click or drag
+	if (widget_state != NK_WIDGET_ROM) {
+		if (nk_input_has_mouse_click_down_in_rect(&ctx->input, NK_BUTTON_LEFT, space, nk_true)) {
+			float mouse_x = ctx->input.mouse.pos.x;
+			float mouse_x_pct = (mouse_x - space.x) / space.w;
+			float seek_secs = mouse_x_pct * video_duration;
+			//printf("seeking to %f seconds\n", seek_secs);
+			seek(seek_secs);
+		}
+	}
+
+	// border
+	//nk_stroke_rect(canvas, space, 0, 1, nk_rgb(200,200,200));
+}
+
+int main(int argc, char* argv[])
+{
 	// video decoder
 	av_register_all();
 	avfilter_register_all();
@@ -209,8 +254,8 @@ int main(int argc, char* argv[]) {
 
 	if (decoder.has_video()) {
 		video_clock = new FrameClock(decoder.get_video_stream()->time_base);
-		// filter graph
-		init_filters(filter_str, decoder.get_video_context(), decoder.get_video_stream());
+		clips.push_back(Clip(&decoder, "fade=t=out:st=1", 0, 2));
+		clips.push_back(Clip(&decoder, "fade=t=in:st=0", 2, av_q2d(decoder.get_video_stream()->time_base) * decoder.get_video_stream()->duration - 2));
 	}
 
 	if (decoder.has_audio()) {
@@ -263,12 +308,9 @@ int main(int argc, char* argv[]) {
 
     ctx = nk_sdl_init(win);
 
-    {
 	// load fonts
-	struct nk_font_atlas *atlas;
     nk_sdl_font_stash_begin(&atlas);
     nk_sdl_font_stash_end();
-	}
 
 	int video_w = 256;
 	int video_h = 256;
@@ -285,8 +327,6 @@ int main(int argc, char* argv[]) {
 	glTexImage2D(GL_TEXTURE_2D, 0, GL_RGB, video_w, video_h, 0, GL_RGB, GL_UNSIGNED_BYTE, NULL);
 	struct nk_image frame_image = nk_image_id(frame_texture);
 
-	play();
-
     background = nk_rgb(28,48,62);
     while (!quit)
     {
@@ -294,46 +334,64 @@ int main(int argc, char* argv[]) {
         SDL_Event evt;
         nk_input_begin(ctx);
         while (SDL_PollEvent(&evt)) {
-            if (evt.type == SDL_QUIT) goto cleanup;
+            if (evt.type == SDL_QUIT)
+				goto cleanup;
             nk_sdl_handle_event(&evt);
+
+			if (evt.type == SDL_KEYDOWN) {
+				switch (evt.key.keysym.sym) {
+					case SDLK_SPACE: play_pause(); break;
+				}
+			}
         }
         nk_input_end(ctx);
 
-		static int video_frame_pts = -1;
+		// show a new frame if we're unpaused or we've seeked -- use pts to determine
 		if (decoder.has_video() && (just_seeked || !paused)) {
-			just_seeked = false;
+			// allow seeking again if we're not showing the just seeked frame
+			if (!just_seeked)
+				last_seek_secs = -1;
+
 			// decode a video frame
 			// decoded_frame is unreffed by decoder
 			AVFrame* decoded_frame = decoder.get_video_frame();
-			AVFrame* filtered_frame = av_frame_alloc();
 			if (decoded_frame != nullptr && decoded_frame->width != 0 && decoded_frame->height != 0) {
-				video_frame_pts = decoded_frame->pts;
-
-				if (av_buffersrc_add_frame_flags(buffersrc_ctx, decoded_frame, AV_BUFFERSRC_FLAG_KEEP_REF) < 0) {
-                    printf("Error while feeding the filtergraph\n");
-                    break;
-                }
-
-				// filtergraph could contain multiple frames from one?
-				while (true) {
-					int ret = av_buffersink_get_frame(buffersink_ctx, filtered_frame);
-					if (ret == AVERROR(EAGAIN) || ret == AVERROR_EOF)
-                        break;
-					if (ret < 0)
-						printf("Error while retrieving from the filter graph: %s\n", av_err2str(ret));
+				just_seeked = false;
+//printf("displaying frame with pts %lld\n", decoded_frame->pts);
+				// find out which clip we're in -- TODO: keep track or otherwise improve this
+				// this needs to change when there are multiple files / decoders
+				// use frame clock for this?
+				last_display_secs = av_q2d(decoder.get_video_stream()->time_base) * decoded_frame->pts;
+				Clip* clip = nullptr;
+				for (auto clip_it = clips.begin(); clip_it != clips.end(); ++clip_it) {
+					if (clip_it->start_secs <= last_display_secs && last_display_secs < clip_it->start_secs + clip_it->duration_secs) {
+						clip = &*clip_it;
+						//printf("using clip %ld\n", clip_it - clips.begin());
+						break;
+					}
+				}
+				if (clip == nullptr) {
+					printf("cannot find clip to use\n");
+					break;
 				}
 
-				if (sws_ctx == nullptr) {
-					sws_ctx = sws_getContext(decoded_frame->width, decoded_frame->height, (enum AVPixelFormat) decoded_frame->format,
-							video_w, video_h, AV_PIX_FMT_RGB24,
-							SWS_BICUBIC, NULL, NULL, NULL);
+				int ret = clip->feed(decoded_frame);
+				if (ret != 0) {
+					printf("error feeding the clip filter\n");
+					break;
+				}
+
+				sws_ctx = sws_getCachedContext(sws_ctx, decoded_frame->width, decoded_frame->height, (enum AVPixelFormat) decoded_frame->format,
+						video_w, video_h, AV_PIX_FMT_RGB24,
+						SWS_BICUBIC, NULL, NULL, NULL);
+				if (rgb_frame == nullptr) {
 					// rgb_frame is reused and unreffed at end of program
 					rgb_frame = av_frame_alloc();
 					av_image_alloc(rgb_frame->data, rgb_frame->linesize, video_w, video_h, AV_PIX_FMT_RGB24, 1);
 				}
 
+				AVFrame* filtered_frame = clip->get_output_frame();
 				sws_scale(sws_ctx, filtered_frame->data, filtered_frame->linesize, 0, filtered_frame->height, rgb_frame->data, rgb_frame->linesize);
-				av_frame_unref(filtered_frame);
 
 				glBindTexture(GL_TEXTURE_2D, frame_texture);
 				glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, video_w, video_h, GL_RGB, GL_UNSIGNED_BYTE, rgb_frame->data[0]);
@@ -346,10 +404,7 @@ int main(int argc, char* argv[]) {
 		}
 
         // GUI
-        if (nk_begin(ctx, "Demo", nk_rect(50, 50, video_w + 50, 500),
-            NK_WINDOW_BORDER|NK_WINDOW_MOVABLE|NK_WINDOW_SCALABLE|
-            NK_WINDOW_CLOSABLE|NK_WINDOW_MINIMIZABLE|NK_WINDOW_TITLE))
-        {
+        if (nk_begin(ctx, "Demo", nk_rect(0, 0, win_width, win_height), 0)) {
             nk_menubar_begin(ctx);
             nk_layout_row_begin(ctx, NK_STATIC, 25, 2);
             nk_layout_row_push(ctx, 45);
@@ -374,6 +429,7 @@ int main(int argc, char* argv[]) {
 			nk_image(ctx, frame_image);
 			nk_layout_row_end(ctx);
 
+			/*
             nk_layout_row_dynamic(ctx, 30, 2);
             if (nk_button_label(ctx, paused ? "play" : "pause"))
 				play_pause();
@@ -381,11 +437,13 @@ int main(int argc, char* argv[]) {
 			AVStream* video_stream = decoder.get_video_stream();
 			int64_t duration = video_stream->duration;
 			int64_t steps = video_stream->duration / video_stream->nb_frames;
-			if (nk_slider_int(ctx, 0, &video_frame_pts, duration, 1)) {
-				decoder.seek(video_frame_pts);
-				just_seeked = true;
-				video_clock->ResetPTS(video_frame_pts);
+			if (nk_slider_int(ctx, 0, &last_video_pts, duration, 1)) {
+				seek(last_video_pts);
 			}
+			*/
+
+			nk_layout_row_dynamic(ctx, 50, 1);
+			widget_clips_bar(ctx);
         }
         nk_end(ctx);
 
@@ -410,7 +468,6 @@ int main(int argc, char* argv[]) {
 cleanup:
 	quit = true;
 
-	avfilter_graph_free(&filter_graph);
 	av_frame_free(&rgb_frame);
 	sws_freeContext(sws_ctx);
 

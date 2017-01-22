@@ -4,7 +4,7 @@ BIN = main
 # Flags
 CFLAGS = -g -std=c++14
 
-SRC = main.cpp common.cpp
+SRC = main.cpp common.cpp clip.cpp
 OBJ = $(SRC:.cpp=.o)
 
 ifeq ($(OS),Windows_NT)
@@ -20,4 +20,4 @@ else
 endif
 
 $(BIN): $(SRC)
-	$(CXX) $(CFLAGS) $^ -o $(BIN) $(LIBS)
+	@$(CXX) $(CFLAGS) $^ -o $(BIN) $(LIBS)

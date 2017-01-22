@@ -42,7 +42,7 @@ public:
 	AVFrame* peek_video_frame();
 	AVFrame* peek_audio_frame();
 
-	void seek(int pts);
+	int64_t seek(float target_secs);
 	int open_file(const char* src_filename);
 
 	bool has_video();
@@ -61,25 +61,28 @@ protected:
 
 	SDL_mutex* seeking_mutex;
 
-	int64_t seek_pts;
+	float seek_secs;
 	SDL_Thread* decoding_thread;
 	int internal_start_decoding();
 	int internal_seek();
 	static int internal_start_decoding_thread(void* param) { return ((Decoder_Ctx*)param)->internal_start_decoding(); }
 
-	void empty_frames();
+	void empty_frame_caches();
 	AVFrame* decode_frame(AVCodecContext* codec_ctx, AVPacket* pkt);
 
 	// file
-	AVFormatContext *format_ctx;
+	AVFormatContext* format_ctx;
+	int read_and_decode(AVFormatContext* format_ctx, AVFrame** out_frame);
 
 	// video stream
 	int video_stream_index;
 	AVCodec* video_decoder;
 	AVCodecContext *video_decoder_ctx;
+	int reopen_video_context();
 
 	// audio stream
 	int audio_stream_index;
 	AVCodec* audio_decoder;
 	AVCodecContext *audio_decoder_ctx;
+	int reopen_audio_context();
 };
