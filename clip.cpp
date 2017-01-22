@@ -8,15 +8,32 @@ Clip::Clip(Decoder_Ctx* decoder, std::string filters_descr, double start_secs, d
 	this->filters_descr = filters_descr;
 
 	this->output_frame = av_frame_alloc();
-
-	init_filters();
 }
+
+Clip::Clip(Decoder_Ctx* decoder, double start_secs, double duration_secs)
+{
+	this->decoder = decoder;
+	this->start_secs = start_secs;
+	this->duration_secs = duration_secs;
+
+	this->output_frame = av_frame_alloc();
+}
+
 
 Clip::~Clip()
 {
 	av_frame_unref(this->output_frame);
-	if (filter_graph == nullptr)
+	if (filter_graph != nullptr)
 		avfilter_graph_free(&this->filter_graph);
+}
+
+void Clip::set_filter_descr(std::string descr)
+{
+	this->filters_descr = filters_descr;
+
+	if (filter_graph != nullptr)
+		avfilter_graph_free(&this->filter_graph);
+	filter_graph = nullptr;
 }
 
 AVFrame* Clip::get_output_frame()
@@ -26,7 +43,20 @@ AVFrame* Clip::get_output_frame()
 
 int Clip::feed(AVFrame* in_frame)
 {
-	int ret = av_buffersrc_add_frame_flags(this->buffersrc_ctx, in_frame, AV_BUFFERSRC_FLAG_KEEP_REF) < 0;
+	int ret;
+
+	// if no filter then just copy frame
+	// otherwise make sure filters are initialized
+	if (filters_descr.empty()) {
+		av_frame_ref(this->output_frame, in_frame);
+		return 0;
+	} else if (this->filter_graph == nullptr) {
+		ret = init_filters();
+		if (ret < 0)
+			return ret;
+	}
+
+	ret = av_buffersrc_add_frame_flags(this->buffersrc_ctx, in_frame, AV_BUFFERSRC_FLAG_KEEP_REF) < 0;
 	if (ret < 0) {
 		printf("Error while feeding the filtergraph: %s\n", av_err2str(ret));
 		return ret;

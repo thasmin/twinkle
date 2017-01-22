@@ -10,6 +10,7 @@
 #include <time.h>
 
 #include <vector>
+#include <list>
 #include <string>
 
 #include <GL/glew.h>
@@ -49,6 +50,7 @@ bool paused = true;
 float last_display_secs = 0;
 float last_seek_secs = -1;
 bool just_seeked = true;
+float clips_bar_last_click_secs = -1;
 
 struct nk_font_atlas *atlas;
 
@@ -63,7 +65,7 @@ FrameClock* audio_clock = nullptr;
 //const char *filter_str = "fade=t=out:st=1,fade=t=in:st=2"; // doesn't work because the fade in sets beginning to black, fade out sets end as black, so it's all black
 //const char *filter_str = "fade=t=in:st=1,fade=t=out:st=2"; // works
 
-std::vector<Clip> clips;
+std::list<Clip> clips;
 
 const char* input_file = "countdown.mp4";
 
@@ -192,14 +194,15 @@ void widget_clips_bar(struct nk_context *ctx)
 
 	// draw boxes for clips
 	int max_height = 28;
-	for (int i = 0; i < clips.size(); ++i) {
-		auto clip_it = clips.begin() + i;
+	int color_num = 0;
+	for (auto clip_it = clips.begin(); clip_it != clips.end(); ++clip_it) {
 		float start = space.w * clip_it->start_secs / video_duration + 1; // add 1 for line thickness
 		float width = space.w * clip_it->duration_secs / video_duration - 10; // dunno why need to subtract 9
 		float height = max_height < space.h ? max_height : space.h;
 		struct nk_rect size = nk_rect(space.x + start, space.y + 1, space.x + width, height);
-		nk_fill_rect(canvas, size, 2, fill_colors[i]);
-		nk_stroke_rect(canvas, size, 2, 3, line_colors[i]);
+		nk_fill_rect(canvas, size, 2, fill_colors[color_num]);
+		nk_stroke_rect(canvas, size, 2, 3, line_colors[color_num]);
+		color_num += 1;
 	}
 
 	// draw marks for each second
@@ -223,8 +226,14 @@ void widget_clips_bar(struct nk_context *ctx)
 	if (nk_input_is_mouse_hovering_rect(&ctx->input, space))
 		nk_stroke_line(canvas, mouse_x, space.y, mouse_x, space.y + space.h, 1, nk_rgb(200,200,200));
 
+	// draw selection vertical line
+	if (clips_bar_last_click_secs != -1) {
+		int selection_x = space.x + space.w * clips_bar_last_click_secs / video_duration;
+		nk_stroke_line(canvas, selection_x, space.y, selection_x, space.y + space.h, 3, nk_rgb(100, 100, 200));
+	}
+
 	// draw current place indicator
-	int current_x = space.w * last_display_secs / video_duration;
+	int current_x = space.x + space.w * last_display_secs / video_duration;
 	nk_stroke_line(canvas, current_x, space.y, current_x, space.y + space.h, 1, nk_rgb(100,100,100));
 
 	// handle seeks via click or drag
@@ -233,13 +242,29 @@ void widget_clips_bar(struct nk_context *ctx)
 			float mouse_x = ctx->input.mouse.pos.x;
 			float mouse_x_pct = (mouse_x - space.x) / space.w;
 			float seek_secs = mouse_x_pct * video_duration;
-			//printf("seeking to %f seconds\n", seek_secs);
 			seek(seek_secs);
+
+			clips_bar_last_click_secs = seek_secs;
 		}
 	}
 
 	// border
 	//nk_stroke_rect(canvas, space, 0, 1, nk_rgb(200,200,200));
+}
+
+void split_clip()
+{
+	if (clips_bar_last_click_secs == -1)
+		return;
+
+	auto clip_it = std::find_if(clips.begin(), clips.end(),
+			[](const Clip& clip) { return clip.start_secs <= last_display_secs && last_display_secs < clip.start_secs + clip.duration_secs; });
+	if (clip_it == clips.end())
+		return;
+
+	Clip to_add = Clip(clip_it->decoder, clips_bar_last_click_secs, clip_it->duration_secs + clip_it->start_secs - clips_bar_last_click_secs);
+	clip_it->duration_secs = clips_bar_last_click_secs - clip_it->start_secs;
+	clips.insert(++clip_it, to_add);
 }
 
 int main(int argc, char* argv[])
@@ -254,8 +279,9 @@ int main(int argc, char* argv[])
 
 	if (decoder.has_video()) {
 		video_clock = new FrameClock(decoder.get_video_stream()->time_base);
-		clips.push_back(Clip(&decoder, "fade=t=out:st=1", 0, 2));
-		clips.push_back(Clip(&decoder, "fade=t=in:st=0", 2, av_q2d(decoder.get_video_stream()->time_base) * decoder.get_video_stream()->duration - 2));
+		//clips.push_back(Clip(&decoder, "fade=t=out:st=1", 0, 2));
+		//clips.push_back(Clip(&decoder, "fade=t=in:st=0", 2, av_q2d(decoder.get_video_stream()->time_base) * decoder.get_video_stream()->duration - 2));
+		clips.push_back(Clip(&decoder, 0, av_q2d(decoder.get_video_stream()->time_base) * decoder.get_video_stream()->duration));
 	}
 
 	if (decoder.has_audio()) {
@@ -338,9 +364,17 @@ int main(int argc, char* argv[])
 				goto cleanup;
             nk_sdl_handle_event(&evt);
 
+			const Uint8 *key_state = SDL_GetKeyboardState(nullptr);
+
 			if (evt.type == SDL_KEYDOWN) {
 				switch (evt.key.keysym.sym) {
 					case SDLK_SPACE: play_pause(); break;
+				}
+			}
+
+			if (evt.type == SDL_KEYUP) {
+				switch (evt.key.keysym.sym) {
+					case SDLK_b: if (key_state[SDL_SCANCODE_LGUI]) split_clip(); break;
 				}
 			}
         }
@@ -362,20 +396,15 @@ int main(int argc, char* argv[])
 				// this needs to change when there are multiple files / decoders
 				// use frame clock for this?
 				last_display_secs = av_q2d(decoder.get_video_stream()->time_base) * decoded_frame->pts;
-				Clip* clip = nullptr;
-				for (auto clip_it = clips.begin(); clip_it != clips.end(); ++clip_it) {
-					if (clip_it->start_secs <= last_display_secs && last_display_secs < clip_it->start_secs + clip_it->duration_secs) {
-						clip = &*clip_it;
-						//printf("using clip %ld\n", clip_it - clips.begin());
-						break;
-					}
-				}
-				if (clip == nullptr) {
+				// same code used in split_clip()
+				auto clip_it = std::find_if(clips.begin(), clips.end(),
+						[](const Clip& clip) { return clip.start_secs <= last_display_secs && last_display_secs < clip.start_secs + clip.duration_secs; });
+				if (clip_it == clips.end()) {
 					printf("cannot find clip to use\n");
 					break;
 				}
 
-				int ret = clip->feed(decoded_frame);
+				int ret = clip_it->feed(decoded_frame);
 				if (ret != 0) {
 					printf("error feeding the clip filter\n");
 					break;
@@ -390,7 +419,7 @@ int main(int argc, char* argv[])
 					av_image_alloc(rgb_frame->data, rgb_frame->linesize, video_w, video_h, AV_PIX_FMT_RGB24, 1);
 				}
 
-				AVFrame* filtered_frame = clip->get_output_frame();
+				AVFrame* filtered_frame = clip_it->get_output_frame();
 				sws_scale(sws_ctx, filtered_frame->data, filtered_frame->linesize, 0, filtered_frame->height, rgb_frame->data, rgb_frame->linesize);
 
 				glBindTexture(GL_TEXTURE_2D, frame_texture);
@@ -428,19 +457,6 @@ int main(int argc, char* argv[])
 			nk_layout_row_static(ctx, video_h, video_w, 1);
 			nk_image(ctx, frame_image);
 			nk_layout_row_end(ctx);
-
-			/*
-            nk_layout_row_dynamic(ctx, 30, 2);
-            if (nk_button_label(ctx, paused ? "play" : "pause"))
-				play_pause();
-
-			AVStream* video_stream = decoder.get_video_stream();
-			int64_t duration = video_stream->duration;
-			int64_t steps = video_stream->duration / video_stream->nb_frames;
-			if (nk_slider_int(ctx, 0, &last_video_pts, duration, 1)) {
-				seek(last_video_pts);
-			}
-			*/
 
 			nk_layout_row_dynamic(ctx, 50, 1);
 			widget_clips_bar(ctx);

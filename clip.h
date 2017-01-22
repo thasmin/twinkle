@@ -20,10 +20,13 @@ public:
 	std::string filters_descr;
 
 	Clip(Decoder_Ctx* decoder, std::string filters_descr, double start_secs, double duration);
+	Clip(Decoder_Ctx* decoder, double start_secs, double duration);
 	~Clip();
 
 	int feed(AVFrame* in);
 	AVFrame* get_output_frame();
+
+	void set_filter_descr(std::string descr);
 
 private:
 	AVFrame* output_frame;
