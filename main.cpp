@@ -1,6 +1,9 @@
-#include <vector>
+#include <chrono>
 #include <list>
+#include <iomanip>
+#include <iostream>
 #include <string>
+#include <vector>
 
 #include <GL/glew.h>
 #include <SDL2/SDL.h>
@@ -25,8 +28,12 @@ extern "C"
 #include "nuklear.h"
 #include "nuklear_sdl_gl3.h"
 
+#include "logger.h"
 #include "common.h"
 #include "clip.h"
+#ifdef __APPLE__
+#include "mac.h"
+#endif
 
 #define WINDOW_WIDTH 800
 #define WINDOW_HEIGHT 600
@@ -34,94 +41,36 @@ extern "C"
 #define MAX_VERTEX_MEMORY 512 * 1024
 #define MAX_ELEMENT_MEMORY 128 * 1024
 
-bool quit = false;
+typedef std::chrono::high_resolution_clock timer_clock;
+
 bool paused = true;
-float last_display_secs = 0;
-float last_seek_secs = -1;
 bool just_seeked = true;
+float last_frame_secs = 0;
+timer_clock::time_point last_frame_clock = timer_clock::now();
+float last_seek_secs = 0;
 float clips_bar_last_click_secs = -1;
 
 struct nk_font_atlas *atlas;
 
-Decoder_Ctx decoder;
-SwsContext* sws_ctx;
 AVFrame* rgb_frame;
-FrameClock* video_clock = nullptr;
-FrameClock* audio_clock = nullptr;
+SDL_AudioDeviceID audio_device = 1; // will never be 1 due to SDL docs
+SDL_AudioSpec audio_spec;
 
-std::list<Clip> clips;
-
-const char* input_file = "countdown.mp4";
+Video video;
 
 #define MAX_AUDIO_FRAME_SIZE 192000 // 1 second of 48khz 32bit audio
-
-void audio_callback(void*, Uint8 *stream, int len)
-{
-	// unfreed memory
-	static uint8_t* audio_buf = (uint8_t*) av_malloc(MAX_AUDIO_FRAME_SIZE * 2);
-	static unsigned int audio_buf_size = 0;
-
-	int orig_len = len;
-
-	static SwrContext* swr_ctx = nullptr;
-	if (swr_ctx == nullptr) {
-		AVCodecContext* decoder_ctx = decoder.get_audio_context();
-		swr_ctx = swr_alloc_set_opts(NULL, AV_CH_LAYOUT_STEREO, AV_SAMPLE_FMT_S16, 44100,
-			decoder_ctx->channel_layout, decoder_ctx->sample_fmt, decoder_ctx->sample_rate,
-		   	0, NULL);
-		if (swr_ctx == nullptr) {
-			printf("error allocing and setting opts on swr\n");
-			exit(1);
-		}
-
-		int ret = swr_init(swr_ctx);
-		if (ret < 0) {
-			printf("error initing swr: %s\n", av_err2str(ret));
-			exit(1);
-		}
-	}
-
-	while (len > 0) {
-		// check whether we have enough stored
-		if (audio_buf_size >= len) {
-			// copy from buffer to stream
-			memcpy(stream, audio_buf, len);
-			// move remainder to beginning of stream
-			memmove(audio_buf, &audio_buf[len], audio_buf_size - len);
-			audio_buf_size -= len;
-			return;
-		}
-
-		// copy whatever we have saved
-		if (audio_buf_size > 0) {
-			// copy from buffer to stream
-			memcpy(stream, audio_buf, audio_buf_size);
-			len -= audio_buf_size;
-			audio_buf_size = 0;
-		}
-
-		// read another frame and store it in the buf
-		AVFrame* audio_frame = decoder.get_audio_frame();
-		if (audio_frame == nullptr) {
-			memset(&stream[orig_len - len], 0, len);
-			return;
-		}
-		int samples_converted = swr_convert(swr_ctx, &audio_buf, MAX_AUDIO_FRAME_SIZE, (const uint8_t **) audio_frame->data, audio_frame->nb_samples);
-		audio_buf_size = av_samples_get_buffer_size(NULL, audio_frame->channels, audio_frame->nb_samples, (enum AVSampleFormat)audio_frame->format, 1) / 2;
-	}
-}
 
 void play()
 {
 	paused = false;
-	if (decoder.has_audio())
-		SDL_PauseAudio(0);
+	SDL_PauseAudioDevice(audio_device, 0);
+	last_frame_clock = timer_clock::now();
 }
 
 void pause()
 {
 	paused = true;
-	SDL_PauseAudio(1);
+	SDL_PauseAudioDevice(audio_device, 1);
 }
 
 void play_pause()
@@ -130,15 +79,114 @@ void play_pause()
 }
 
 void seek(float seek_secs) {
-	if (last_seek_secs == seek_secs)
-		return;
+	just_seeked = video.seek(seek_secs);
+	last_frame_secs = seek_secs;
+}
 
-//printf("seeking to %.2f secs\n", seek_secs);
-	int seek_pts = decoder.seek(seek_secs);
-	if (video_clock != nullptr)
-		video_clock->ResetPTS(seek_pts);
-	last_seek_secs = seek_secs;
-	just_seeked = true;
+void split_clip()
+{
+	if (clips_bar_last_click_secs == -1)
+		return;
+	video.main_track.split(clips_bar_last_click_secs, TransitionEffect::Fade);
+}
+
+void load_test_scenario()
+{
+	video.addToMainTrack("concert.mp4", TransitionEffect::None);
+	video.addToOverlayTrack("overlay.mov", TransitionEffect::None);
+	std::this_thread::sleep_for(std::chrono::milliseconds(10));
+	//seek(1.0f);
+	//video.main_track.split(1, TransitionEffect::Fade);
+	play();
+}
+
+void audio_callback(void*, Uint8 *stream, int len)
+{
+	// unfreed memory
+	static uint8_t* audio_buf = new uint8_t[MAX_AUDIO_FRAME_SIZE * 2];
+	static unsigned int audio_buf_size = 0;
+
+	static int count = 0;
+
+	int orig_len = len;
+
+	static SwrContext* swr_ctx = nullptr;
+	if (swr_ctx == nullptr) {
+		const AVCodecContext* decoder_ctx = video.main_track.get_audio_context();
+		int layout = audio_spec.channels == 2 ? AV_CH_LAYOUT_STEREO : AV_CH_LAYOUT_MONO;
+		swr_ctx = swr_alloc_set_opts(NULL, layout, AV_SAMPLE_FMT_S16, audio_spec.freq,
+			decoder_ctx->channel_layout, decoder_ctx->sample_fmt, decoder_ctx->sample_rate,
+		   	0, NULL);
+		if (swr_ctx == nullptr) {
+			Logger::get("error") << "error allocing and setting opts on swr\n";
+			exit(1);
+		}
+
+		int ret = swr_init(swr_ctx);
+		if (ret < 0) {
+			Logger::get("error") << "error initing swr: " << av_err2str(ret) << "\n";
+			exit(1);
+		}
+	}
+
+	Logger::get("audio") << "requested " << len << " bytes for audio stream\n";
+	while (len > 0) {
+		// check whether we have enough stored
+		if (audio_buf_size >= len) {
+			Logger::get("audio") << "copying " << len << " bytes to stream, have " << audio_buf_size - len << " left\n";
+			// copy from buffer to stream
+			memcpy(stream, audio_buf, len);
+			// move remainder to beginning of stream
+			memmove(audio_buf, &audio_buf[len], audio_buf_size - len);
+			audio_buf_size -= len;
+			break;
+		}
+
+		// copy whatever we have saved
+		if (audio_buf_size > 0) {
+			Logger::get("audio") << "copying the remaining " << audio_buf_size << " bytes to stream\n";
+			// copy from buffer to stream
+			memcpy(stream, audio_buf, audio_buf_size);
+			len -= audio_buf_size;
+			audio_buf_size = 0;
+		}
+
+		// read another frame and store it in the buf
+		AVFrame* audio_frame = video.main_track.get_audio_frame();
+		if (audio_frame == nullptr) {
+			memset(&stream[orig_len - len], 0, len);
+			break;
+		}
+		memset(audio_buf, 0, MAX_AUDIO_FRAME_SIZE * 2);
+		int samples_converted = swr_convert(swr_ctx, &audio_buf, MAX_AUDIO_FRAME_SIZE, (const uint8_t **) audio_frame->data, audio_frame->nb_samples);
+		audio_buf_size = av_samples_get_buffer_size(NULL, audio_spec.channels, samples_converted, AV_SAMPLE_FMT_S16, 1);
+		Logger::get("audio") << "samples_converted: " << samples_converted << ", audio_buf_size: " << audio_buf_size << "\n";
+		if (count++ == 70)
+			continue;
+	}
+
+	Logger::get("audio") << "---\n";
+}
+
+void open_audio(const AVCodecContext* audio)
+{
+	SDL_AudioSpec desired;
+	memset(&desired, 0, sizeof(desired));
+
+	// audio
+	desired.freq = audio->sample_rate;
+	Logger::get("audio") << "audio sample rate " << audio->sample_rate << ", " << audio->channels << " channels, format " << audio->sample_fmt << "\n";
+	desired.format = AUDIO_S16SYS;
+	desired.channels = audio->channels;
+	desired.silence = 0;
+	desired.samples = 1024;
+	desired.callback = audio_callback;
+	audio_device = SDL_OpenAudioDevice(NULL, 0, &desired, &audio_spec, SDL_AUDIO_ALLOW_ANY_CHANGE);
+	if (audio_device == 0) {
+		Logger::get("error") << "SDL_OpenAudio: " << SDL_GetError() << "\n";
+		return;
+	}
+	Logger::get("audio") << "received sample rate " << audio_spec.freq << ", " << (char)(audio_spec.channels + '0') << " channels, format " << audio_spec.format << "\n";
 }
 
 void widget_clips_bar(struct nk_context *ctx)
@@ -150,7 +198,7 @@ void widget_clips_bar(struct nk_context *ctx)
 	if (!widget_state)
 		return;
 
-	float video_duration = av_q2d(decoder.get_video_stream()->time_base) * decoder.get_video_stream()->duration;
+	float video_duration = video.get_duration_secs();
 	float pixels_per_sec = space.w / video_duration;
 	// color scheme from https://flatuicolors.com/
 	struct nk_color fill_colors[] = {
@@ -176,12 +224,11 @@ void widget_clips_bar(struct nk_context *ctx)
 		nk_rgb(236, 240, 241),
 	};
 
-	// draw boxes for clips
 	int max_height = 28;
 	int color_num = 0;
-	for (auto clip_it = clips.begin(); clip_it != clips.end(); ++clip_it) {
-		float start = space.w * clip_it->start_secs / video_duration + 1; // add 1 for line thickness
-		float width = space.w * clip_it->duration_secs / video_duration - 10; // dunno why need to subtract 9
+	for (auto piece_it = video.main_track.pieces.begin(); piece_it != video.main_track.pieces.end(); ++piece_it) {
+		float start = space.w * piece_it->file.video_start_secs / video_duration + 1; // add 1 for line thickness
+		float width = space.w * piece_it->file.duration_secs / video_duration - 10; // dunno why need to subtract 9
 		float height = max_height < space.h ? max_height : space.h;
 		struct nk_rect size = nk_rect(space.x + start, space.y + 1, space.x + width, height);
 		nk_fill_rect(canvas, size, 2, fill_colors[color_num]);
@@ -217,7 +264,7 @@ void widget_clips_bar(struct nk_context *ctx)
 	}
 
 	// draw current place indicator
-	int current_x = space.x + space.w * last_display_secs / video_duration;
+	int current_x = space.x + space.w * video.get_last_video_frame_secs() / video_duration;
 	nk_stroke_line(canvas, current_x, space.y, current_x, space.y + space.h, 1, nk_rgb(100,100,100));
 
 	// handle seeks via click or drag
@@ -226,9 +273,12 @@ void widget_clips_bar(struct nk_context *ctx)
 			float mouse_x = ctx->input.mouse.pos.x;
 			float mouse_x_pct = (mouse_x - space.x) / space.w;
 			float seek_secs = mouse_x_pct * video_duration;
-			seek(seek_secs);
 
-			clips_bar_last_click_secs = seek_secs;
+			if (just_seeked || last_seek_secs != seek_secs) {
+				seek(seek_secs);
+				last_seek_secs = seek_secs;
+				clips_bar_last_click_secs = seek_secs;
+			}
 		}
 	}
 
@@ -236,54 +286,20 @@ void widget_clips_bar(struct nk_context *ctx)
 	//nk_stroke_rect(canvas, space, 0, 1, nk_rgb(200,200,200));
 }
 
-void split_clip()
-{
-	if (clips_bar_last_click_secs == -1)
-		return;
-
-	auto clip_it = std::find_if(clips.begin(), clips.end(),
-			[](const Clip& clip) { return clip.start_secs <= last_display_secs && last_display_secs < clip.start_secs + clip.duration_secs; });
-	if (clip_it == clips.end())
-		return;
-
-	Clip to_add = Clip(clips_bar_last_click_secs, clip_it->duration_secs + clip_it->start_secs - clips_bar_last_click_secs);
-	clip_it->duration_secs = clips_bar_last_click_secs - clip_it->start_secs;
-	clips.insert(++clip_it, to_add);
-}
-
 int main(int argc, char* argv[])
 {
+	Logger::addCategory("error");
+	//Logger::addCategory("audio");
+	//Logger::addCategory("clip_recalc");
+	//Logger::addCategory("get_video_frame");
+	//Logger::addCategory("realtime");
+	//Logger::addCategory("filter");
+	//Logger::addCategory("decoder");
+	Logger::addCategory("overlay");
+
 	// video decoder
 	av_register_all();
 	avfilter_register_all();
-
-	if (decoder.open_file(input_file) != 0)
-		exit(1);
-	SDL_Delay(10);
-
-	if (decoder.has_video()) {
-		video_clock = new FrameClock(decoder.get_video_stream()->time_base);
-		//clips.push_back(Clip(&decoder, "fade=t=out:st=1", 0, 2));
-		//clips.push_back(Clip(&decoder, "fade=t=in:st=0", 2, av_q2d(decoder.get_video_stream()->time_base) * decoder.get_video_stream()->duration - 2));
-		clips.push_back(Clip(0, av_q2d(decoder.get_video_stream()->time_base) * decoder.get_video_stream()->duration));
-	}
-
-	if (decoder.has_audio()) {
-		audio_clock = new FrameClock(decoder.get_audio_stream()->time_base);
-		// audio
-		const int AUDIO_BUFFER_SIZE = 1024;
-		SDL_AudioSpec wanted_spec;
-		wanted_spec.freq = decoder.get_audio_context()->sample_rate;
-		wanted_spec.format = AUDIO_S16SYS;
-		wanted_spec.channels = decoder.get_audio_context()->channels;
-		wanted_spec.silence = 0;
-		wanted_spec.samples = AUDIO_BUFFER_SIZE;
-		wanted_spec.callback = audio_callback;
-		if (SDL_OpenAudio(&wanted_spec, NULL) < 0) {
-			fprintf(stderr, "SDL_OpenAudio: %s\n", SDL_GetError());
-			return -1;
-		}
-	}
 
     // Platform
     SDL_Window *win;
@@ -296,7 +312,7 @@ int main(int argc, char* argv[])
 
     // SDL setup
     SDL_SetHint(SDL_HINT_VIDEO_HIGHDPI_DISABLED, "0");
-    SDL_Init(SDL_INIT_VIDEO|SDL_INIT_TIMER|SDL_INIT_EVENTS);
+    SDL_Init(SDL_INIT_VIDEO|SDL_INIT_AUDIO|SDL_INIT_TIMER|SDL_INIT_EVENTS);
     SDL_GL_SetAttribute (SDL_GL_CONTEXT_FLAGS, SDL_GL_CONTEXT_FORWARD_COMPATIBLE_FLAG);
     SDL_GL_SetAttribute (SDL_GL_CONTEXT_PROFILE_MASK, SDL_GL_CONTEXT_PROFILE_CORE);
     SDL_GL_SetAttribute(SDL_GL_CONTEXT_MAJOR_VERSION, 3);
@@ -312,7 +328,7 @@ int main(int argc, char* argv[])
     glViewport(0, 0, win_width, win_height);
     glewExperimental = 1;
     if (glewInit() != GLEW_OK) {
-        fprintf(stderr, "Failed to setup GLEW\n");
+		Logger::get("error") << "Failed to setup GLEW\n";
         exit(1);
     }
 
@@ -337,9 +353,25 @@ int main(int argc, char* argv[])
 	glTexImage2D(GL_TEXTURE_2D, 0, GL_RGB, video_w, video_h, 0, GL_RGB, GL_UNSIGNED_BYTE, NULL);
 	struct nk_image frame_image = nk_image_id(frame_texture);
 
+	// start with black texture
+	uint8_t* black_frame = new uint8_t[video_w * video_h * 3];
+	memset(black_frame, 0, video_w * video_h * 3);
+	glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, video_w, video_h, GL_RGB, GL_UNSIGNED_BYTE, black_frame);
+	delete[] black_frame;
+
+	load_test_scenario();
+
     background = nk_rgb(28,48,62);
-    while (!quit)
+    while (true)
     {
+		// set up audio
+		if (audio_device == 1) {
+			Logger::get("audio") << "setting up audio\n";
+			open_audio(video.main_track.get_audio_context());
+			if (!paused)
+				SDL_PauseAudioDevice(audio_device, 0);
+		}
+
         // Input
         SDL_Event evt;
         nk_input_begin(ctx);
@@ -364,55 +396,30 @@ int main(int argc, char* argv[])
         }
         nk_input_end(ctx);
 
-		// show a new frame if we're unpaused or we've seeked -- use pts to determine
-		if (decoder.has_video() && (just_seeked || !paused)) {
-			// allow seeking again if we're not showing the just seeked frame
-			if (!just_seeked)
-				last_seek_secs = -1;
+		// show next frame if not paused and we've waited long enough or if just seeked
+		if (just_seeked || !paused) {
+			if (just_seeked)
+				last_frame_clock = timer_clock::now();
 
-			// decode a video frame
-			// decoded_frame is unreffed by decoder
-			AVFrame* decoded_frame = decoder.get_video_frame();
-			if (decoded_frame != nullptr && decoded_frame->width != 0 && decoded_frame->height != 0) {
-				just_seeked = false;
-//printf("displaying frame with pts %lld\n", decoded_frame->pts);
-				// find out which clip we're in -- TODO: keep track or otherwise improve this
-				// this needs to change when there are multiple files / decoders
-				// use frame clock for this?
-				last_display_secs = av_q2d(decoder.get_video_stream()->time_base) * decoded_frame->pts;
-				// same code used in split_clip()
-				auto clip_it = std::find_if(clips.begin(), clips.end(),
-						[](const Clip& clip) { return clip.start_secs <= last_display_secs && last_display_secs < clip.start_secs + clip.duration_secs; });
-				if (clip_it == clips.end()) {
-					printf("cannot find clip to use\n");
-					break;
-				}
+			// advance frame if not paused unless just seeked
+			if (!just_seeked && !paused) {
+				auto now = timer_clock::now();
+				Logger::get("realtime") << "adding " << std::chrono::duration_cast<std::chrono::duration<float>>(now - last_frame_clock).count() << "s\n";
+				last_frame_secs += std::chrono::duration_cast<std::chrono::duration<float>>(now - last_frame_clock).count();
+				last_frame_clock = now;
+			}
+			just_seeked = false;
 
-				int ret = clip_it->feed(decoded_frame);
-				if (ret != 0) {
-					printf("error feeding the clip filter\n");
-					break;
-				}
+			// realtime frame logging
+			static auto start = std::chrono::high_resolution_clock::now();
+			auto rt_now = std::chrono::high_resolution_clock::now();
+			std::chrono::duration<double> duration = rt_now - start;
+			Logger::get("realtime") << "asking for frame at " << std::setprecision(4) << last_frame_secs << "s at " << duration.count() << "s, diff " << duration.count() - last_frame_secs << "s\n";
 
-				sws_ctx = sws_getCachedContext(sws_ctx, decoded_frame->width, decoded_frame->height, (enum AVPixelFormat) decoded_frame->format,
-						video_w, video_h, AV_PIX_FMT_RGB24,
-						SWS_BICUBIC, NULL, NULL, NULL);
-				if (rgb_frame == nullptr) {
-					// rgb_frame is reused and unreffed at end of program
-					rgb_frame = av_frame_alloc();
-					av_image_alloc(rgb_frame->data, rgb_frame->linesize, video_w, video_h, AV_PIX_FMT_RGB24, 1);
-				}
-
-				AVFrame* filtered_frame = clip_it->get_output_frame();
-				sws_scale(sws_ctx, filtered_frame->data, filtered_frame->linesize, 0, filtered_frame->height, rgb_frame->data, rgb_frame->linesize);
-
+			int ret = video.get_video_frame(last_frame_secs, video_w, video_h);
+			if (ret == 0) {
 				glBindTexture(GL_TEXTURE_2D, frame_texture);
-				glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, video_w, video_h, GL_RGB, GL_UNSIGNED_BYTE, rgb_frame->data[0]);
-
-				// delay until next video frame and render
-				int video_delay_msec = video_clock->GetDelayMsec(decoded_frame);
-				if (video_delay_msec > 0)
-					SDL_Delay(video_delay_msec);
+				glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, video_w, video_h, GL_RGB, GL_UNSIGNED_BYTE, video.out_frame->data[0]);
 			}
 		}
 
@@ -423,7 +430,20 @@ int main(int argc, char* argv[])
             nk_layout_row_push(ctx, 45);
             if (nk_menu_begin_label(ctx, "FILE", NK_TEXT_LEFT, nk_vec2(120, 200))) {
                 nk_layout_row_dynamic(ctx, 30, 1);
-                nk_menu_item_label(ctx, "OPEN", NK_TEXT_LEFT);
+                if (nk_menu_item_label(ctx, "ADD VIDEO", NK_TEXT_LEFT)) {
+					std::string new_video = path();
+					if (new_video.size() > 0) {
+						video.addToMainTrack(new_video, TransitionEffect::Fade);
+						std::this_thread::sleep_for(std::chrono::milliseconds(10));
+					}
+				}
+                if (nk_menu_item_label(ctx, "ADD OVERLAY", NK_TEXT_LEFT)) {
+					std::string new_video = path();
+					if (new_video.size() > 0) {
+						video.addToOverlayTrack(new_video, TransitionEffect::Fade);
+						std::this_thread::sleep_for(std::chrono::milliseconds(10));
+					}
+				}
                 nk_menu_item_label(ctx, "CLOSE", NK_TEXT_LEFT);
                 nk_menu_end(ctx);
             }
@@ -466,10 +486,7 @@ int main(int argc, char* argv[])
     }
 
 cleanup:
-	quit = true;
-
 	av_frame_free(&rgb_frame);
-	sws_freeContext(sws_ctx);
 
     nk_sdl_shutdown();
     SDL_GL_DeleteContext(glContext);

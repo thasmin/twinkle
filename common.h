@@ -1,36 +1,25 @@
 #pragma once
 
-#include <map>
+#include <atomic>
 #include <chrono>
+#include <map>
+#include <mutex>
+#include <string>
+#include <thread>
 
 extern "C" {
 // ffmpeg headers
 #include <libavutil/imgutils.h>
 #include <libavformat/avformat.h>
-#include <libswscale/swscale.h>
-
-// SDL2 headers for SDL_Mutex and SDL_Queue
-#include <SDL2/SDL.h>
-#include <SDL2/SDL_thread.h>
 }
-
-class FrameClock {
-public:
-	FrameClock(AVRational time_base);
-	int GetDelayMsec(AVFrame* frame);
-	void ResetPTS(int64_t pts);
-
-	int64_t last_pts;
-	int64_t frame_pts;
-
-protected:
-	double pts_to_msec;
-};
 
 class Decoder_Ctx {
 public:
 	// only written in decoding thread, only read when decoding thread is finished
 	int errnum;
+	std::string filename;
+
+	static float get_duration_secs(const std::string& filename);
 
 	Decoder_Ctx();
 	virtual ~Decoder_Ctx();
@@ -41,28 +30,38 @@ public:
 	AVFrame* get_audio_frame();
 	AVFrame* peek_video_frame();
 	AVFrame* peek_audio_frame();
+	AVFrame* get_video_frame_at(float secs);
+	float get_last_video_frame_secs();
 
 	int64_t seek(float target_secs);
-	int open_file(const char* src_filename);
+	int open_file(const std::string& filename);
+	int open_file(const std::string& filename, float seek_secs);
 
 	bool has_video();
 	bool has_audio();
-	AVStream* get_video_stream();
-	AVStream* get_audio_stream();
-	AVCodecContext* get_video_context();
-	AVCodecContext* get_audio_context();
+	const AVStream* get_video_stream() const;
+	const AVStream* get_audio_stream() const;
+	const AVCodecContext* get_video_context() const;
+	const AVCodecContext* get_audio_context() const;
+
+	int get_num_frames_in(float duration_secs) const;
+	int64_t get_pts_at(float secs) const;
 
 protected:
-	SDL_mutex* video_mutex;
+	std::mutex video_mutex;
 	std::map<int64_t, AVFrame*> video_frames;
+	float last_video_frame_secs = 0;
 
-	SDL_mutex* audio_mutex;
+	std::mutex audio_mutex;
 	std::map<int64_t, AVFrame*> audio_frames;
 
-	SDL_mutex* seeking_mutex;
+	std::mutex seeking_mutex;
 
-	float seek_secs;
-	SDL_Thread* decoding_thread;
+	int internal_open_file(const std::string& filename);
+
+	float seek_secs; // switch to atomic_float?
+	std::atomic_bool stop_decoding_thread;
+	std::thread decoding_thread;
 	int internal_start_decoding();
 	int internal_seek();
 	static int internal_start_decoding_thread(void* param) { return ((Decoder_Ctx*)param)->internal_start_decoding(); }

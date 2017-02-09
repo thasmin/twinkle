@@ -1,50 +1,44 @@
 #include "common.h"
 
+#include <iomanip>
+
 extern "C"
 {
 #include "libavutil/time.h"
 }
 
+#include "logger.h"
+
 using namespace std;
 
-// OMG global across files fix it fix it fix it
-extern bool quit;
-
-FrameClock::FrameClock(AVRational time_base)
+float Decoder_Ctx::get_duration_secs(const std::string& filename)
 {
-	this->pts_to_msec = av_q2d(time_base) * 1000.0;
-	this->frame_pts = 0;
-	this->last_pts = 0;
-}
+	AVFormatContext* format_ctx = nullptr;
 
-double time_diff_to_millis(chrono::time_point<chrono::steady_clock> end, chrono::time_point<chrono::steady_clock> start)
-{
-	return chrono::duration_cast<chrono::milliseconds>(end - start).count();
-}
+	// open decoder file, and allocate format context
+	int ret = avformat_open_input(&format_ctx, filename.c_str(), nullptr, nullptr);
+	if (ret < 0) {
+		Logger::get("error") << "Could not open source file " << filename << ": " << av_err2str(ret) << "\n";
+		return -1;
+	}
 
-int FrameClock::GetDelayMsec(AVFrame* frame)
-{
-	static auto last_time_point = chrono::steady_clock::now();
+	// retrieve stream information
+	ret = avformat_find_stream_info(format_ctx, nullptr);
+	if (ret < 0) {
+		Logger::get("error") << "Could not find stream information in file " << filename << ": " << av_err2str(ret) << "\n";
+		return -1;
+	}
 
-	int64_t delta_pts = frame->pts - this->last_pts;
-	double delta_msec = delta_pts * pts_to_msec;
-	auto show_at = last_time_point + chrono::milliseconds((int)delta_msec);
+	if (format_ctx->nb_streams < 1) {
+		Logger::get("error") << "No streams in file " << filename << "\n";
+		return -1;
+	}
 
-	auto now = chrono::steady_clock::now();
-	int delay_msec = 0;
-	if (this->last_pts > 0 && now < show_at)
-		delay_msec = (int)time_diff_to_millis(show_at, now);
+	AVStream* stream = format_ctx->streams[0];
+	float duration = av_q2d(stream->time_base) * stream->duration;
 
-	this->last_pts = frame->pts;
-	last_time_point = now + chrono::milliseconds(delay_msec);
-	this->frame_pts = frame->pts;
-
-	return delay_msec;
-}
-
-void FrameClock::ResetPTS(int64_t pts)
-{
-	this->last_pts = pts;
+	avformat_close_input(&format_ctx);
+	return duration;
 }
 
 Decoder_Ctx::Decoder_Ctx()
@@ -60,12 +54,8 @@ Decoder_Ctx::Decoder_Ctx()
 	this->audio_decoder = nullptr;
 	this->audio_decoder_ctx = nullptr;
 
-	this->decoding_thread = nullptr;
-	this->video_mutex = SDL_CreateMutex();
-	this->audio_mutex = SDL_CreateMutex();
-
 	this->seek_secs = -1;
-	this->seeking_mutex = SDL_CreateMutex();
+	this->stop_decoding_thread = false;
 }
 
 Decoder_Ctx::~Decoder_Ctx()
@@ -75,16 +65,16 @@ Decoder_Ctx::~Decoder_Ctx()
 
 void Decoder_Ctx::close()
 {
-	if (this->decoding_thread != nullptr)
-		SDL_DetachThread(this->decoding_thread);
-	SDL_DestroyMutex(this->video_mutex);
-	SDL_DestroyMutex(this->audio_mutex);
+	this->stop_decoding_thread = true;
+	if (decoding_thread.joinable())
+		decoding_thread.join();
+	this->stop_decoding_thread = false;
 
 	avformat_close_input(&this->format_ctx);
 	if (this->video_decoder_ctx != nullptr)
 		avcodec_close(this->video_decoder_ctx);
 	if (this->audio_decoder_ctx != nullptr)
-	avcodec_close(this->audio_decoder_ctx);
+		avcodec_close(this->audio_decoder_ctx);
 
 	empty_frame_caches();
 }
@@ -103,73 +93,152 @@ void Decoder_Ctx::empty_frame_caches()
 AVFrame* Decoder_Ctx::get_video_frame()
 {
 	AVFrame* first_frame = nullptr;
-	SDL_LockMutex(this->video_mutex);
+	this->video_mutex.lock();
 	auto it = this->video_frames.begin();
 	if (it != this->video_frames.end()) {
 		first_frame = it->second;
+		this->last_video_frame_secs = first_frame->pts * av_q2d(this->get_video_stream()->time_base);
 		this->video_frames.erase(it);
 	}
-	SDL_UnlockMutex(this->video_mutex);
+	this->video_mutex.unlock();
 	return first_frame;
 }
 
 AVFrame* Decoder_Ctx::get_audio_frame()
 {
 	AVFrame* first_frame = nullptr;
-	SDL_LockMutex(this->audio_mutex);
+	this->audio_mutex.lock();
 	auto it = this->audio_frames.begin();
 	if (it != this->audio_frames.end()) {
 		first_frame = it->second;
 		this->audio_frames.erase(it);
 	}
-	SDL_UnlockMutex(this->audio_mutex);
+	this->audio_mutex.unlock();
 	return first_frame;
+}
+
+float Decoder_Ctx::get_last_video_frame_secs()
+{
+	return this->last_video_frame_secs;
 }
 
 AVFrame* Decoder_Ctx::peek_video_frame()
 {
 	AVFrame* first_frame = nullptr;
-	SDL_LockMutex(this->video_mutex);
+	this->video_mutex.lock();
 	auto it = this->video_frames.begin();
 	if (it != this->video_frames.end())
 		first_frame = it->second;
-	SDL_UnlockMutex(this->video_mutex);
+	this->video_mutex.unlock();
 	return first_frame;
 }
 
 AVFrame* Decoder_Ctx::peek_audio_frame()
 {
 	AVFrame* first_frame = nullptr;
-	SDL_LockMutex(this->audio_mutex);
+	this->audio_mutex.lock();
 	auto it = this->audio_frames.begin();
 	if (it != this->audio_frames.end())
 		first_frame = it->second;
-	SDL_UnlockMutex(this->audio_mutex);
+	this->audio_mutex.unlock();
 	return first_frame;
+}
+
+AVFrame* Decoder_Ctx::get_video_frame_at(float secs)
+{
+	int64_t target_pts = this->get_pts_at(secs);
+	Logger::get("get_video_frame") << "got request for frame at " << secs << ", pts " << target_pts << "\n";
+	Logger::get("get_video_frame") << "video time base " << get_video_stream()->time_base.num << " / " << get_video_stream()->time_base.den << "\n";
+
+	video_mutex.lock();
+	if (this->video_frames.size() == 0) {
+		Logger::get("decoder") << "decoder " << this << " no cached video frames\n";
+		video_mutex.unlock();
+		return nullptr;
+	}
+
+	// assumes video_frames are sequential
+	// if frame cache doesn't have pts, seek
+	auto first_frame = this->video_frames.begin();
+	auto last_frame = std::next(this->video_frames.end(), -1);
+	Logger::get("get_video_frame") << "cache has pts " << first_frame->first << " to " << last_frame->first << "\n";
+	if (last_frame->first < target_pts || first_frame->first > target_pts) {
+		Logger::get("get_video_frame") << "seeking to " << secs << "\n";
+		video_mutex.unlock();
+		seek(secs);
+		std::this_thread::sleep_for(std::chrono::milliseconds(200));
+		video_mutex.lock();
+
+		first_frame = this->video_frames.begin();
+		last_frame = std::next(this->video_frames.end(), -1);
+		Logger::get("get_video_frame") << "done seeking, cache has pts " << first_frame->first << " to " << last_frame->first << "\n";
+	}
+
+	// if the frame still isn't in the frame cache, we don't have it
+	first_frame = this->video_frames.begin();
+	last_frame = std::next(this->video_frames.end(), -1);
+	if (last_frame->first < target_pts || first_frame->first > target_pts) {
+		Logger::get("get_video_frame") << "frame not found after seeking\n";
+		video_mutex.unlock();
+		return nullptr;
+	}
+
+	// remove the first frames from the queue until we found the right one
+	AVFrame* frame = first_frame->second;
+	auto second_frame = std::next(first_frame, 1);
+	Logger::get("get_video_frame") << "first frame pts " << first_frame->first << ", second frame pts " << second_frame->first << "\n";
+	while (second_frame != this->video_frames.end() && second_frame->first < target_pts) {
+		Logger::get("get_video_frame") << "skipping to second frame\n";
+		this->video_frames.erase(first_frame);
+		first_frame = this->video_frames.begin();
+		second_frame = std::next(first_frame, 1);
+		frame = first_frame->second;
+	}
+
+	Logger::get("get_video_frame") << "returning frame with pts " << frame->pts << "\n";
+	this->last_video_frame_secs = frame->pts * av_q2d(this->get_video_stream()->time_base);
+	Logger::get("get_video_frame") << "decoder pts " << frame->pts << ", last_video_frame_secs: " << std::setprecision(3) << this->last_video_frame_secs << "\n---\n";
+	video_mutex.unlock();
+
+
+	static auto start = std::chrono::high_resolution_clock::now();
+	if (frame->pts == 0)
+		start = std::chrono::high_resolution_clock::now();
+	auto now = std::chrono::high_resolution_clock::now();
+	std::chrono::duration<double> duration = now - start;
+	//Logger::get("realtime") << "showing pts " << frame->pts << " at " << std::setprecision(4) << duration.count() << "s\n";
+
+	return frame;
 }
 
 int Decoder_Ctx::read_and_decode(AVFormatContext* format_ctx, AVFrame** out_frame)
 {
 	*out_frame = nullptr;
+	int stream_index = -1;
 
-	static AVPacket pkt;
+	AVPacket pkt;
 	av_init_packet(&pkt);
 	pkt.data = nullptr;
 	pkt.size = 0;
 
 	while (*out_frame == nullptr) {
 		this->errnum = av_read_frame(this->format_ctx, &pkt);
-//printf("read frame for decoding, pts %lld\n", pkt.pts);
+		Logger::get("decoder") << "decoder " << this << " read frame for decoding, pts " << pkt.pts << "\n";
 		if (this->errnum < 0) {
-			fprintf(stderr, "Error reading frame (%s)\n", av_err2str(this->errnum));
+			Logger::get("error") << "decoder " << this << "Error reading frame: " << av_err2str(this->errnum) << "\n";
+			av_packet_unref(&pkt);
 			return this->errnum;
 		}
 
 		AVCodecContext* codec_ctx = nullptr;
-		if (pkt.stream_index == this->audio_stream_index)
+		stream_index = pkt.stream_index;
+		if (stream_index == this->audio_stream_index) {
+			Logger::get("decoder") << "decoder " << this << " read an audio frame\n";
 			codec_ctx = this->audio_decoder_ctx;
-		if (pkt.stream_index == this->video_stream_index)
+		} if (stream_index == this->video_stream_index) {
+			Logger::get("decoder") << "decoder " << this << " read an video frame\n";
 			codec_ctx = this->video_decoder_ctx;
+		}
 
 		// keep reading if it's not an interesting stream
 		if (codec_ctx == nullptr)
@@ -181,40 +250,41 @@ int Decoder_Ctx::read_and_decode(AVFormatContext* format_ctx, AVFrame** out_fram
 			return this->errnum;
 	}
 
-	return pkt.stream_index;
+	av_packet_unref(&pkt);
+	return stream_index;
 }
 
 int Decoder_Ctx::internal_start_decoding()
 {
-	AVPacket pkt;
-
-	while (!quit) {
-		SDL_LockMutex(this->seeking_mutex);
+	while (!this->stop_decoding_thread) {
+		this->seeking_mutex.lock();
 		internal_seek();
-		SDL_UnlockMutex(this->seeking_mutex);
+		this->seeking_mutex.unlock();
 
 		// wait until we need frames - switch to condition
 		int need_video_frames = this->video_stream_index >= 0 ? 10 : 0;
 		int need_audio_frames = this->audio_stream_index >= 0 ? 10 : 0;
 		if (this->video_frames.size() >= need_video_frames && this->audio_frames.size() >= need_audio_frames) {
-			SDL_Delay(1);
+			std::this_thread::sleep_for(std::chrono::milliseconds(1));
 			continue;
 		}
 
-		AVFrame* decoded_frame;
+		AVFrame* decoded_frame = nullptr;
 		int stream_index = this->read_and_decode(this->format_ctx, &decoded_frame);
 
 		if (stream_index < 0) {
+			Logger::get("error") << "decoder " << this << "got an error while reading and decoding: " << av_err2str(this->errnum) << "\n";
 			return stream_index;
 		} else if (stream_index == this->audio_stream_index) {
-			SDL_LockMutex(this->audio_mutex);
+			this->audio_mutex.lock();
 			this->audio_frames[decoded_frame->pts] = decoded_frame;
-			SDL_UnlockMutex(this->audio_mutex);
+			Logger::get("decoder") << "decoder " << this << " decoded a audio frame with pts " << decoded_frame->pts << ", cache now has " << this->audio_frames.size() << " frames\n";
+			this->audio_mutex.unlock();
 		} else if (stream_index == this->video_stream_index) {
-//printf("decoded video frame with pts %lld\n", frame->pts);
-			SDL_LockMutex(this->video_mutex);
+			this->video_mutex.lock();
 			this->video_frames[decoded_frame->pts] = decoded_frame;
-			SDL_UnlockMutex(this->video_mutex);
+			Logger::get("decoder") << "decoder " << this << " decoded a video frame with pts " << decoded_frame->pts << ", cache now has " << this->video_frames.size() << " frames\n";
+			this->video_mutex.unlock();
 		}
 	}
 
@@ -235,7 +305,7 @@ AVFrame* Decoder_Ctx::decode_frame(AVCodecContext* codec_ctx, AVPacket* pkt)
 	if (this->errnum < 0) {
 		// EAGAIN is OK
 		if (this->errnum != AVERROR(EAGAIN))
-			fprintf(stderr, "Error decoding frame (%s)\n", av_err2str(this->errnum));
+			Logger::get("error") << "decoder " << this << "Error decoding frame: " << av_err2str(this->errnum) << "\n";
 		return nullptr;
 	}
 
@@ -245,19 +315,22 @@ AVFrame* Decoder_Ctx::decode_frame(AVCodecContext* codec_ctx, AVPacket* pkt)
 // returns pts for secs
 int64_t Decoder_Ctx::seek(float target_secs)
 {
-	SDL_LockMutex(this->seeking_mutex);
+	Logger::get("decoder") << "decoder " << this << " decoder seeking to " << target_secs << "\n";
+	this->seeking_mutex.lock();
 	this->seek_secs = target_secs;
-	SDL_UnlockMutex(this->seeking_mutex);
+	this->seeking_mutex.unlock();
 	return av_q2d(this->get_video_stream()->time_base) * this->seek_secs;
 }
 
 int Decoder_Ctx::internal_seek()
 {
+	this->errnum = 0;
+
 	if (this->seek_secs == -1)
 		return 0;
 
-	SDL_LockMutex(this->audio_mutex);
-	SDL_LockMutex(this->video_mutex);
+	this->audio_mutex.lock();
+	this->video_mutex.lock();
 
 	reopen_audio_context();
 	reopen_video_context();
@@ -267,36 +340,34 @@ int Decoder_Ctx::internal_seek()
 	int64_t seek_pts = this->seek_secs / av_q2d(this->get_video_stream()->time_base);
 	av_seek_frame(this->format_ctx, this->video_stream_index, seek_pts, AVSEEK_FLAG_BACKWARD);
 
-	AVPacket pkt;
-	av_init_packet(&pkt);
-	while (true) {
-		AVFrame* decoded_frame;
-		int stream_index = this->read_and_decode(this->format_ctx, &decoded_frame);
+	// read packets until found the right pts on the right stream
+	if (this->seek_secs > 0) {
+		AVPacket pkt;
+		av_init_packet(&pkt);
+		while (true) {
+			AVFrame* decoded_frame;
+			int stream_index = this->read_and_decode(this->format_ctx, &decoded_frame);
 
-		if (stream_index < 0) {
-			fprintf(stderr, "Error reading video frame after seeking (%s)\n", av_err2str(this->errnum));
-			return stream_index;
+			if (stream_index < 0) {
+				Logger::get("error") << "decoder " << this << "Error reading video frame after seeking: " << av_err2str(this->errnum) << "\n";
+				return stream_index;
+			}
+
+			// this is the next video frame
+			if (stream_index == this->video_stream_index && decoded_frame->pts >= seek_pts) {
+				this->video_frames[decoded_frame->pts] = decoded_frame;
+				Logger::get("get_video_frame") << "seeked to a video frame with pts " << decoded_frame->pts << "\n";
+				break;
+			}
 		}
-
-		if (stream_index == this->video_stream_index && decoded_frame->pts >= seek_pts)
-			break;
 	}
 
 	this->seek_secs = -1;
 
-	SDL_UnlockMutex(this->audio_mutex);
-	SDL_UnlockMutex(this->video_mutex);
+	this->video_mutex.unlock();
+	this->audio_mutex.unlock();
 
 	return 0;
-}
-
-void print_error(int code, const char *msg, ...)
-{
-	va_list args;
-	va_start(args, msg);
-	vfprintf(stderr, msg, args);
-	va_end(args);
-	fprintf(stderr, "  %s\n", av_err2str(code));
 }
 
 int Decoder_Ctx::reopen_audio_context() {
@@ -311,7 +382,7 @@ int Decoder_Ctx::reopen_audio_context() {
 	// allocate decoder context
 	this->audio_decoder_ctx = avcodec_alloc_context3(this->audio_decoder);
 	if (!this->audio_decoder_ctx) {
-		fprintf(stderr, "Could not allocate a decoding context\n");
+		Logger::get("error") << "decoder " << this << "Could not allocate a decoding context\n";
 		ret = AVERROR(ENOMEM);
 		return ret;
 	}
@@ -319,12 +390,12 @@ int Decoder_Ctx::reopen_audio_context() {
 	// initialize the stream parameters with demuxer information
 	ret = avcodec_parameters_to_context(this->audio_decoder_ctx, this->format_ctx->streams[this->audio_stream_index]->codecpar);
 	if (ret < 0) {
-		fprintf(stderr, "Failed to copy parameters to context\n");
+		Logger::get("error") << "decoder " << this << "Failed to copy parameters to context\n";
 		return ret;
 	}
 
 	if ((ret = avcodec_open2(this->audio_decoder_ctx, this->audio_decoder, nullptr)) < 0) {
-		fprintf(stderr, "Failed to open %s codec\n", av_get_media_type_string(AVMEDIA_TYPE_AUDIO));
+		Logger::get("error") << "decoder " << this << "Failed to open " << av_get_media_type_string(AVMEDIA_TYPE_AUDIO) << " codec\n";
 		return ret;
 	}
 
@@ -344,7 +415,7 @@ int Decoder_Ctx::reopen_video_context() {
 	// allocate decoder context
 	this->video_decoder_ctx = avcodec_alloc_context3(this->video_decoder);
 	if (!this->video_decoder_ctx) {
-		fprintf(stderr, "Could not allocate a decoding context\n");
+		Logger::get("error") << "decoder " << this << "Could not allocate a decoding context\n";
 		ret = AVERROR(ENOMEM);
 		return ret;
 	}
@@ -352,33 +423,58 @@ int Decoder_Ctx::reopen_video_context() {
 	// initialize the stream parameters with demuxer information
 	ret = avcodec_parameters_to_context(this->video_decoder_ctx, this->format_ctx->streams[this->video_stream_index]->codecpar);
 	if (ret < 0) {
-		fprintf(stderr, "Failed to copy parameters to context\n");
+		Logger::get("error") << "decoder " << this << "Failed to copy parameters to context\n";
 		return ret;
 	}
 
 	if ((ret = avcodec_open2(this->video_decoder_ctx, this->video_decoder, nullptr)) < 0) {
-		fprintf(stderr, "Failed to open %s codec\n", av_get_media_type_string(AVMEDIA_TYPE_VIDEO));
+		Logger::get("error") << "decoder " << this << "Failed to open " << av_get_media_type_string(AVMEDIA_TYPE_VIDEO) << " codec\n";
 		return ret;
 	}
 
 	return 0;
 }
 
-int Decoder_Ctx::open_file(const char* src_filename)
+int Decoder_Ctx::open_file(const std::string& filename, float seek_secs)
+{
+	int ret = this->internal_open_file(filename);
+	if (ret < 0)
+		return ret;
+
+	if (seek_secs > 0)
+		this->seek(seek_secs);
+	this->decoding_thread = std::thread(&Decoder_Ctx::internal_start_decoding, this);
+	return 0;
+}
+
+int Decoder_Ctx::open_file(const std::string& filename)
+{
+	int ret = this->internal_open_file(filename);
+	if (ret < 0)
+		return ret;
+
+	this->decoding_thread = std::thread(&Decoder_Ctx::internal_start_decoding, this);
+	return 0;
+}
+
+int Decoder_Ctx::internal_open_file(const std::string& filename)
 {
 	int ret = 0;
 
+	close();
+
 	// open decoder file, and allocate format context
-	ret = avformat_open_input(&this->format_ctx, src_filename, nullptr, nullptr);
+	ret = avformat_open_input(&this->format_ctx, filename.c_str(), nullptr, nullptr);
 	if (ret < 0) {
-		print_error(ret, "Could not open source file %s\n", src_filename);
+		Logger::get("error") << "decoder " << this << "Could not open source file " << filename << ": " << av_err2str(ret) << "\n";
 		return ret;
 	}
+	this->filename = filename;
 
 	// retrieve stream information
 	ret = avformat_find_stream_info(this->format_ctx, nullptr);
 	if (ret < 0) {
-		print_error(ret, "Could not find stream information\n");
+		Logger::get("error") << "decoder " << this << "Could not find stream information: " << av_err2str(ret) << "\n";
 		return ret;
 	}
 
@@ -388,7 +484,7 @@ int Decoder_Ctx::open_file(const char* src_filename)
 		// find decoder
 		this->video_decoder = avcodec_find_decoder(this->format_ctx->streams[this->video_stream_index]->codecpar->codec_id);
 		if (!this->video_decoder) {
-			fprintf(stderr, "Failed to find %s codec\n", av_get_media_type_string(AVMEDIA_TYPE_VIDEO));
+			Logger::get("error") << "decoder " << this << "Failed to find " << av_get_media_type_string(AVMEDIA_TYPE_VIDEO) << " codec\n";
 			ret = AVERROR(EINVAL);
 			return ret;
 		}
@@ -403,7 +499,7 @@ int Decoder_Ctx::open_file(const char* src_filename)
 		// find decoder
 		this->audio_decoder = avcodec_find_decoder(this->format_ctx->streams[this->audio_stream_index]->codecpar->codec_id);
 		if (!this->audio_decoder) {
-			fprintf(stderr, "Failed to find %s codec\n", av_get_media_type_string(AVMEDIA_TYPE_VIDEO));
+			Logger::get("error") << "decoder " << this << "Failed to find " << av_get_media_type_string(AVMEDIA_TYPE_AUDIO) << " codec\n";
 			ret = AVERROR(EINVAL);
 			return ret;
 		}
@@ -411,8 +507,6 @@ int Decoder_Ctx::open_file(const char* src_filename)
 		if (reopen_audio_context() < 0)
 			return ret;
 	}
-
-	this->decoding_thread = SDL_CreateThread(&internal_start_decoding_thread, "DecoderThread", this);
 
 	return 0;
 }
@@ -427,24 +521,34 @@ bool Decoder_Ctx::has_audio()
 	return this->audio_stream_index >= 0;
 }
 
-AVStream* Decoder_Ctx::get_video_stream()
+const AVStream* Decoder_Ctx::get_video_stream() const
 {
 	if (this->video_stream_index < 0)
 		return nullptr;
 	return this->format_ctx->streams[this->video_stream_index];
 }
 
-AVStream* Decoder_Ctx::get_audio_stream()
+const AVStream* Decoder_Ctx::get_audio_stream() const
 {
 	return this->format_ctx->streams[this->audio_stream_index];
 }
 
-AVCodecContext* Decoder_Ctx::get_video_context()
+const AVCodecContext* Decoder_Ctx::get_video_context() const
 {
 	return this->video_decoder_ctx;
 }
 
-AVCodecContext* Decoder_Ctx::get_audio_context()
+const AVCodecContext* Decoder_Ctx::get_audio_context() const
 {
 	return this->audio_decoder_ctx;
+}
+
+int Decoder_Ctx::get_num_frames_in(float duration_secs) const
+{
+	return duration_secs * av_q2d(get_video_stream()->avg_frame_rate);
+}
+
+int64_t Decoder_Ctx::get_pts_at(float secs) const
+{
+	return secs / av_q2d(get_video_stream()->time_base);
 }
