@@ -27,6 +27,8 @@ enum class FilterEffect {
 	RGB,
 	SoloTrack,
 	OverlayTrack,
+	AudioMix,
+	AudioPrep,
 };
 
 // API requires filtergraph outputs only one frame per input frame
@@ -51,6 +53,8 @@ public:
 	static Filter* RGB(const Decoder_Ctx* decoder1);
 	static Filter* SoloTrack(const Decoder_Ctx* decoder, int out_width, int out_height);
 	static Filter* OverlayTrack(const Decoder_Ctx* decoder1, const Decoder_Ctx* decoder2, int out_width, int out_height);
+	static Filter* AudioMix(const Decoder_Ctx* decoder1, const Decoder_Ctx* decoder2);
+	static Filter* AudioPrep(const Decoder_Ctx* decoder1);
 
 protected:
 	Filter(FilterEffect effect, const std::string& filter_str);
@@ -124,9 +128,9 @@ public:
 	void split(float secs, TransitionEffect effect);
 	bool seek(float secs);
 
-	AVFrame* get_frame(float secs);
+	AVFrame* get_video_frame(float secs);
 	//AVFrame* get_audio_frame(float secs);
-	AVFrame* get_audio_frame();
+	AVFrame* get_next_audio_frame();
 	const Decoder_Ctx* get_decoder() const;
 	const AVCodecContext* get_audio_context() const;
 
@@ -164,12 +168,17 @@ public:
 	void addToOverlayTrack(const std::string& filename, TransitionEffect effect);
 	bool seek(float secs);
 
-	AVFrame* out_frame = nullptr;
+	AVFrame* out_video_frame = nullptr;
 	float get_duration_secs();
 	int get_video_frame(float secs, int width, int height);
 	float get_last_video_frame_secs();
 
+	AVFrame* out_audio_frame = nullptr;
+	int get_next_audio_frame();
+
 private:
 	Filter* solo_track_filter;
 	Filter* overlay_track_filter;
+	Filter* audiomix_filter;
+	Filter* audioprep_filter;
 };

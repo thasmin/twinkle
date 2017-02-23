@@ -106,28 +106,7 @@ void audio_callback(void*, Uint8 *stream, int len)
 	static uint8_t* audio_buf = new uint8_t[MAX_AUDIO_FRAME_SIZE * 2];
 	static unsigned int audio_buf_size = 0;
 
-	static int count = 0;
-
-	int orig_len = len;
-
-	static SwrContext* swr_ctx = nullptr;
-	if (swr_ctx == nullptr) {
-		const AVCodecContext* decoder_ctx = video.main_track.get_audio_context();
-		int layout = audio_spec.channels == 2 ? AV_CH_LAYOUT_STEREO : AV_CH_LAYOUT_MONO;
-		swr_ctx = swr_alloc_set_opts(NULL, layout, AV_SAMPLE_FMT_S16, audio_spec.freq,
-			decoder_ctx->channel_layout, decoder_ctx->sample_fmt, decoder_ctx->sample_rate,
-		   	0, NULL);
-		if (swr_ctx == nullptr) {
-			Logger::get("error") << "error allocing and setting opts on swr\n";
-			exit(1);
-		}
-
-		int ret = swr_init(swr_ctx);
-		if (ret < 0) {
-			Logger::get("error") << "error initing swr: " << av_err2str(ret) << "\n";
-			exit(1);
-		}
-	}
+	int copied = 0;
 
 	Logger::get("audio") << "requested " << len << " bytes for audio stream\n";
 	while (len > 0) {
@@ -135,7 +114,7 @@ void audio_callback(void*, Uint8 *stream, int len)
 		if (audio_buf_size >= len) {
 			Logger::get("audio") << "copying " << len << " bytes to stream, have " << audio_buf_size - len << " left\n";
 			// copy from buffer to stream
-			memcpy(stream, audio_buf, len);
+			memcpy(&stream[copied], audio_buf, len);
 			// move remainder to beginning of stream
 			memmove(audio_buf, &audio_buf[len], audio_buf_size - len);
 			audio_buf_size -= len;
@@ -148,36 +127,36 @@ void audio_callback(void*, Uint8 *stream, int len)
 			// copy from buffer to stream
 			memcpy(stream, audio_buf, audio_buf_size);
 			len -= audio_buf_size;
+			copied += audio_buf_size;
 			audio_buf_size = 0;
 		}
 
 		// read another frame and store it in the buf
-		AVFrame* audio_frame = video.main_track.get_audio_frame();
-		if (audio_frame == nullptr) {
-			memset(&stream[orig_len - len], 0, len);
+		int ret = video.get_next_audio_frame();
+		if (ret < 0) {
+			Logger::get("audio") << "unable to get audio frame: " << av_err2str(ret) << "\n";
+			memset(&stream[copied], 0, len);
 			break;
 		}
-		memset(audio_buf, 0, MAX_AUDIO_FRAME_SIZE * 2);
-		int samples_converted = swr_convert(swr_ctx, &audio_buf, MAX_AUDIO_FRAME_SIZE, (const uint8_t **) audio_frame->data, audio_frame->nb_samples);
-		audio_buf_size = av_samples_get_buffer_size(NULL, audio_spec.channels, samples_converted, AV_SAMPLE_FMT_S16, 1);
-		Logger::get("audio") << "samples_converted: " << samples_converted << ", audio_buf_size: " << audio_buf_size << "\n";
-		if (count++ == 70)
-			continue;
+
+		AVFrame* audio_frame = video.out_audio_frame;
+		audio_buf_size = av_samples_get_buffer_size(NULL, audio_frame->channels, audio_frame->nb_samples, AV_SAMPLE_FMT_S16, 1);
+		memcpy(audio_buf, audio_frame->data[0], audio_buf_size);
 	}
 
 	Logger::get("audio") << "---\n";
 }
 
-void open_audio(const AVCodecContext* audio)
+void open_audio()
 {
 	SDL_AudioSpec desired;
 	memset(&desired, 0, sizeof(desired));
 
 	// audio
-	desired.freq = audio->sample_rate;
-	Logger::get("audio") << "audio sample rate " << audio->sample_rate << ", " << audio->channels << " channels, format " << audio->sample_fmt << "\n";
+	desired.freq = 44100;
+	//desired.freq = 48000;
 	desired.format = AUDIO_S16SYS;
-	desired.channels = audio->channels;
+	desired.channels = 2;
 	desired.silence = 0;
 	desired.samples = 1024;
 	desired.callback = audio_callback;
@@ -199,7 +178,7 @@ void widget_clips_bar(struct nk_context *ctx)
 		return;
 
 	float video_duration = video.get_duration_secs();
-	float pixels_per_sec = space.w / video_duration;
+	//float pixels_per_sec = space.w / video_duration;
 	// color scheme from https://flatuicolors.com/
 	struct nk_color fill_colors[] = {
 		nk_rgb(192, 57, 43),
@@ -292,6 +271,7 @@ int main(int argc, char* argv[])
 	//Logger::addCategory("audio");
 	//Logger::addCategory("clip_recalc");
 	//Logger::addCategory("get_video_frame");
+	//Logger::addCategory("get_audio_frame");
 	//Logger::addCategory("realtime");
 	//Logger::addCategory("filter");
 	//Logger::addCategory("decoder");
@@ -361,17 +341,16 @@ int main(int argc, char* argv[])
 
 	load_test_scenario();
 
+	// set up audio
+	if (audio_device == 1) {
+		open_audio();
+		if (!paused)
+			SDL_PauseAudioDevice(audio_device, 0);
+	}
+
     background = nk_rgb(28,48,62);
     while (true)
     {
-		// set up audio
-		if (audio_device == 1) {
-			Logger::get("audio") << "setting up audio\n";
-			open_audio(video.main_track.get_audio_context());
-			if (!paused)
-				SDL_PauseAudioDevice(audio_device, 0);
-		}
-
         // Input
         SDL_Event evt;
         nk_input_begin(ctx);
@@ -419,7 +398,7 @@ int main(int argc, char* argv[])
 			int ret = video.get_video_frame(last_frame_secs, video_w, video_h);
 			if (ret == 0) {
 				glBindTexture(GL_TEXTURE_2D, frame_texture);
-				glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, video_w, video_h, GL_RGB, GL_UNSIGNED_BYTE, video.out_frame->data[0]);
+				glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, video_w, video_h, GL_RGB, GL_UNSIGNED_BYTE, video.out_video_frame->data[0]);
 			}
 		}
 

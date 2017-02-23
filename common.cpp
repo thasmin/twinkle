@@ -144,71 +144,98 @@ AVFrame* Decoder_Ctx::peek_audio_frame()
 	return first_frame;
 }
 
-AVFrame* Decoder_Ctx::get_video_frame_at(float secs)
+AVFrame* Decoder_Ctx::internal_get_frame_at(float secs, int media_type)
 {
-	int64_t target_pts = this->get_pts_at(secs);
-	Logger::get("get_video_frame") << "got request for frame at " << secs << ", pts " << target_pts << "\n";
-	Logger::get("get_video_frame") << "video time base " << get_video_stream()->time_base.num << " / " << get_video_stream()->time_base.den << "\n";
+	std::map<int64_t, AVFrame*>* cache;
+	std::mutex* mutex;
+	std::ostream* logger;
+	const AVStream* stream;
+	std::string media;
 
-	video_mutex.lock();
-	if (this->video_frames.size() == 0) {
-		Logger::get("decoder") << "decoder " << this << " no cached video frames\n";
-		video_mutex.unlock();
+	if (media_type == AVMEDIA_TYPE_VIDEO) {
+		cache = &this->video_frames;
+		mutex = &this->video_mutex;
+		logger = &Logger::get("get_video_frame");
+		stream = this->get_video_stream();
+		media = "video";
+	} else if (media_type == AVMEDIA_TYPE_AUDIO) {
+		cache = &this->audio_frames;
+		mutex = &this->audio_mutex;
+		logger = &Logger::get("get_audio_frame");
+		stream = this->get_audio_stream();
+		media = "audio";
+	} else {
+		Logger::get("error") << "unknown media type while getting frame\n";
 		return nullptr;
 	}
 
-	// assumes video_frames are sequential
+	int64_t target_pts = this->get_pts_at(stream, secs);
+	*logger << "got request for frame at " << secs << ", pts " << target_pts << "\n";
+	*logger << media << " time base " << stream->time_base.num << " / " << stream->time_base.den << "\n";
+
+	mutex->lock();
+	if (cache->size() == 0) {
+		Logger::get("decoder") << "decoder " << this << " no cached " << media << " frames\n";
+		mutex->unlock();
+		return nullptr;
+	}
+
+	// assumes are sequential
 	// if frame cache doesn't have pts, seek
-	auto first_frame = this->video_frames.begin();
-	auto last_frame = std::next(this->video_frames.end(), -1);
-	Logger::get("get_video_frame") << "cache has pts " << first_frame->first << " to " << last_frame->first << "\n";
+	auto first_frame = cache->begin();
+	auto last_frame = std::next(cache->end(), -1);
+	*logger << "cache has pts " << first_frame->first << " to " << last_frame->first << "\n";
 	if (last_frame->first < target_pts || first_frame->first > target_pts) {
-		Logger::get("get_video_frame") << "seeking to " << secs << "\n";
-		video_mutex.unlock();
+		*logger << "seeking to " << secs << "\n";
+		mutex->unlock();
 		seek(secs);
 		std::this_thread::sleep_for(std::chrono::milliseconds(200));
-		video_mutex.lock();
+		mutex->lock();
 
-		first_frame = this->video_frames.begin();
-		last_frame = std::next(this->video_frames.end(), -1);
-		Logger::get("get_video_frame") << "done seeking, cache has pts " << first_frame->first << " to " << last_frame->first << "\n";
+		first_frame = cache->begin();
+		last_frame = std::next(cache->end(), -1);
+		*logger << "done seeking, cache has pts " << first_frame->first << " to " << last_frame->first << "\n";
 	}
 
 	// if the frame still isn't in the frame cache, we don't have it
-	first_frame = this->video_frames.begin();
-	last_frame = std::next(this->video_frames.end(), -1);
 	if (last_frame->first < target_pts || first_frame->first > target_pts) {
-		Logger::get("get_video_frame") << "frame not found after seeking\n";
-		video_mutex.unlock();
+		*logger << "frame not found after seeking\n";
+		mutex->unlock();
 		return nullptr;
 	}
 
 	// remove the first frames from the queue until we found the right one
 	AVFrame* frame = first_frame->second;
 	auto second_frame = std::next(first_frame, 1);
-	Logger::get("get_video_frame") << "first frame pts " << first_frame->first << ", second frame pts " << second_frame->first << "\n";
-	while (second_frame != this->video_frames.end() && second_frame->first < target_pts) {
-		Logger::get("get_video_frame") << "skipping to second frame\n";
-		this->video_frames.erase(first_frame);
-		first_frame = this->video_frames.begin();
+	*logger << "first frame pts " << first_frame->first << ", second frame pts " << second_frame->first << "\n";
+	while (second_frame != cache->end() && second_frame->first < target_pts) {
+		*logger << "skipping to second frame\n";
+		cache->erase(first_frame);
+		first_frame = cache->begin();
 		second_frame = std::next(first_frame, 1);
 		frame = first_frame->second;
 	}
 
-	Logger::get("get_video_frame") << "returning frame with pts " << frame->pts << "\n";
-	this->last_video_frame_secs = frame->pts * av_q2d(this->get_video_stream()->time_base);
-	Logger::get("get_video_frame") << "decoder pts " << frame->pts << ", last_video_frame_secs: " << std::setprecision(3) << this->last_video_frame_secs << "\n---\n";
-	video_mutex.unlock();
+	*logger << "returning frame with pts " << frame->pts << "\n";
 
+	if (media_type == AVMEDIA_TYPE_VIDEO) {
+		this->last_video_frame_secs = frame->pts * av_q2d(stream->time_base);
+		Logger::get("get_video_frame") << "decoder pts " << frame->pts << ", last_video_frame_secs: " << std::setprecision(3) << this->last_video_frame_secs << "\n---\n";
+	}
 
-	static auto start = std::chrono::high_resolution_clock::now();
-	if (frame->pts == 0)
-		start = std::chrono::high_resolution_clock::now();
-	auto now = std::chrono::high_resolution_clock::now();
-	std::chrono::duration<double> duration = now - start;
-	//Logger::get("realtime") << "showing pts " << frame->pts << " at " << std::setprecision(4) << duration.count() << "s\n";
+	mutex->unlock();
 
 	return frame;
+}
+
+AVFrame* Decoder_Ctx::get_audio_frame_at(float secs)
+{
+	return internal_get_frame_at(secs, AVMEDIA_TYPE_AUDIO);
+}
+
+AVFrame* Decoder_Ctx::get_video_frame_at(float secs)
+{
+	return internal_get_frame_at(secs, AVMEDIA_TYPE_VIDEO);
 }
 
 int Decoder_Ctx::read_and_decode(AVFormatContext* format_ctx, AVFrame** out_frame)
@@ -233,10 +260,8 @@ int Decoder_Ctx::read_and_decode(AVFormatContext* format_ctx, AVFrame** out_fram
 		AVCodecContext* codec_ctx = nullptr;
 		stream_index = pkt.stream_index;
 		if (stream_index == this->audio_stream_index) {
-			Logger::get("decoder") << "decoder " << this << " read an audio frame\n";
 			codec_ctx = this->audio_decoder_ctx;
 		} if (stream_index == this->video_stream_index) {
-			Logger::get("decoder") << "decoder " << this << " read an video frame\n";
 			codec_ctx = this->video_decoder_ctx;
 		}
 
@@ -548,7 +573,7 @@ int Decoder_Ctx::get_num_frames_in(float duration_secs) const
 	return duration_secs * av_q2d(get_video_stream()->avg_frame_rate);
 }
 
-int64_t Decoder_Ctx::get_pts_at(float secs) const
+int64_t Decoder_Ctx::get_pts_at(const AVStream* stream, float secs) const
 {
-	return secs / av_q2d(get_video_stream()->time_base);
+	return secs / av_q2d(stream->time_base) + stream->start_time;
 }

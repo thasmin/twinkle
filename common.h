@@ -31,6 +31,7 @@ public:
 	AVFrame* peek_video_frame();
 	AVFrame* peek_audio_frame();
 	AVFrame* get_video_frame_at(float secs);
+	AVFrame* get_audio_frame_at(float secs);
 	float get_last_video_frame_secs();
 
 	int64_t seek(float target_secs);
@@ -45,7 +46,7 @@ public:
 	const AVCodecContext* get_audio_context() const;
 
 	int get_num_frames_in(float duration_secs) const;
-	int64_t get_pts_at(float secs) const;
+	int64_t get_pts_at(const AVStream* stream, float secs) const;
 
 protected:
 	std::mutex video_mutex;
@@ -58,6 +59,7 @@ protected:
 	std::mutex seeking_mutex;
 
 	int internal_open_file(const std::string& filename);
+	AVFrame* internal_get_frame_at(float secs, int media_type);
 
 	float seek_secs; // switch to atomic_float?
 	std::atomic_bool stop_decoding_thread;

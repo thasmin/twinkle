@@ -33,6 +33,8 @@ std::ostream& operator<<(std::ostream& out, const FilterEffect value){
 		SWITCH_VAL(FilterEffect::RGB);
 		SWITCH_VAL(FilterEffect::SoloTrack);
 		SWITCH_VAL(FilterEffect::OverlayTrack);
+		SWITCH_VAL(FilterEffect::AudioMix);
+		SWITCH_VAL(FilterEffect::AudioPrep);
 	}
 #undef SWITCH_VAL
 	return out << s;
@@ -59,6 +61,29 @@ std::string get_buffersink_str(const std::string& input_name)
 	ss << "[" << input_name << "] buffersink";
 	return ss.str();
 }
+
+std::string get_abuffer_str(const Decoder_Ctx* decoder, const std::string& output_name)
+{
+	const AVCodecContext* audio_ctx = decoder->get_audio_context();
+	const AVStream* audio_stream = decoder->get_audio_stream();
+
+	std::stringstream ss;
+	ss << "abuffer=";
+	ss << "time_base=" << audio_stream->time_base.num << "/" << audio_stream->time_base.den << ":";
+	ss << "sample_rate=" << audio_ctx->sample_rate << ":";
+	ss << "sample_fmt=" << audio_ctx->sample_fmt << ":";
+	ss << "channel_layout=" << audio_ctx->channel_layout << " ";
+	ss << "[" << output_name << "];";
+	return ss.str();
+}
+
+std::string get_abuffersink_str(const std::string& input_name)
+{
+	std::stringstream ss;
+	ss << "[" << input_name << "] abuffersink";
+	return ss.str();
+}
+
 
 Filter* Filter::FadeOut(const Decoder_Ctx* decoder, float duration)
 {
@@ -111,8 +136,8 @@ Filter* Filter::Overlay(const Decoder_Ctx* decoder1, const Decoder_Ctx* decoder2
 
 	std::stringstream filter_str;
 	filter_str << buffer1_str << buffer2_str << box_str << scale_str << overlay_str << sink_str;
-	Logger::get("overlay") << filter_str.str();
 
+	Logger::get("overlay") << filter_str.str() << "\n";
 	return new Filter(FilterEffect::Overlay, filter_str.str());
 }
 
@@ -144,7 +169,42 @@ Filter* Filter::OverlayTrack(const Decoder_Ctx* decoder1, const Decoder_Ctx* dec
 	filter_str << "[overlayed] format=pix_fmts=rgb24 [result];";
 	filter_str << sink_str;
 
+	Logger::get("overlay") << filter_str.str() << "\n";
 	return new Filter(FilterEffect::OverlayTrack, filter_str.str());
+}
+
+Filter* Filter::AudioMix(const Decoder_Ctx* decoder1, const Decoder_Ctx* decoder2)
+{
+	std::string buffer1_str = get_abuffer_str(decoder1, "in_1");
+	std::string buffer2_str = get_abuffer_str(decoder2, "in_2");
+	std::string sink_str = get_abuffersink_str("result");
+
+	std::stringstream filter_str;
+	filter_str << buffer1_str;
+	filter_str << buffer2_str;
+	filter_str << "[in_1] aresample=osr=44100:ocl=stereo:osf=s16 [r1];";
+	filter_str << "[in_2] aresample=osr=44100:ocl=stereo:osf=s16 [r2];";
+	filter_str << "[r2] [r1] amix=inputs=2 [mixed];";
+	filter_str << "[mixed] aresample=osr=44100:ocl=stereo:osf=s16 [result];";
+	filter_str << sink_str;
+
+	return new Filter(FilterEffect::AudioMix, filter_str.str());
+}
+
+Filter* Filter::AudioPrep(const Decoder_Ctx* decoder)
+{
+	std::string buffer1_str = get_abuffer_str(decoder, "in_1");
+	std::string sink_str = get_abuffersink_str("result");
+
+	std::stringstream filter_str;
+	filter_str << buffer1_str;
+	filter_str << "[in_1] aresample=osr=44100:ocl=stereo:osf=s16 [result];";
+	//filter_str << "[in_1] aformat=sample_fmts=s16:sample_rates=44100:channel_layouts=3 [result];";
+	//filter_str << "[in_1] anull [result];";
+	filter_str << sink_str;
+
+	Logger::get("overlay") << filter_str.str() << "\n";
+	return new Filter(FilterEffect::AudioPrep, filter_str.str());
 }
 
 Filter::Filter(FilterEffect effect, const std::string& filter_str)
@@ -196,12 +256,12 @@ int Filter::init(const std::string& filter_str)
 	for (int i = 0; i < this->graph->nb_filters; ++i) {
 		AVFilterContext* f_ctx = graph->filters[i];
 		std::string filter_name = f_ctx->filter->name;
-		if (filter_name == "buffer") {
+		if (filter_name == "buffer" || filter_name == "abuffer") {
 			if (this->buffersrc_ctx == nullptr)
 				this->buffersrc_ctx = f_ctx;
 			else
 				this->buffersrc2_ctx = f_ctx;
-		} else if (filter_name == "buffersink")
+		} else if (filter_name == "buffersink" || filter_name == "abuffersink")
 			this->buffersink_ctx = f_ctx;
 	}
 
@@ -256,12 +316,9 @@ int Filter::feed(AVFrame* in, AVFrame* in2)
 	if (in->pts == this->last_pts1_fed && in2->pts == this->last_pts2_fed)
 		return 0;
 
-	Logger::get("overlay") << "filtering frame 1 pts: " << in->pts << ", frame 2 pts: " << in2->pts << "\n";
-
 	frames_fed += 1;
 
 	if (this->last_pts1_fed != in->pts) {
-		Logger::get("overlay") << "adding frame 1 pts: " << in->pts << "\n";
 		ret = av_buffersrc_write_frame(this->buffersrc_ctx, in) < 0;
 		if (ret < 0) {
 			Logger::get("error") << "Error while adding frame 1 to the filtergraph: " << av_err2str(ret) << "\n";
@@ -270,8 +327,7 @@ int Filter::feed(AVFrame* in, AVFrame* in2)
 		this->last_pts1_fed = in->pts;
 	}
 
-	if (this->last_pts2_fed != in2->pts) {
-		Logger::get("overlay") << "adding frame 2 pts: " << in2->pts << "\n";
+	if (this->buffersrc2_ctx != nullptr && this->last_pts2_fed != in2->pts) {
 		ret = av_buffersrc_write_frame(this->buffersrc2_ctx, in2) < 0;
 		if (ret < 0) {
 			Logger::get("error") << "Error while adding frame 2 to the filtergraph: " << av_err2str(ret) << "\n";
@@ -280,7 +336,6 @@ int Filter::feed(AVFrame* in, AVFrame* in2)
 		this->last_pts2_fed = in2->pts;
 	}
 
-	bool framed = false;
 	while (true) {
 		ret = av_buffersink_get_frame(this->buffersink_ctx, this->output_frame);
 		if (ret == AVERROR(EAGAIN) || ret == AVERROR_EOF)
@@ -289,7 +344,6 @@ int Filter::feed(AVFrame* in, AVFrame* in2)
 			Logger::get("error") << "Error while retrieving from the filter graph: " << av_err2str(ret) << "\n";
 			return ret;
 		}
-		framed = true;
 	}
 
 	return 0;
@@ -568,24 +622,11 @@ const AVCodecContext* Track::get_audio_context() const
 	return this->decoder->get_audio_context();
 }
 
-/*
-AVFrame* Track::get_audio_frame(float secs)
-{
-	Clip* clip = find_clip_at(secs);
-	if (clip == nullptr) {
-		printf("no clip\n");
-		return nullptr;
-	}
-
-	return this->decoder->get_audio_frame_at(secs - clip->video_start_secs + clip->file_start_secs);
-}
-*/
-
-AVFrame* Track::get_audio_frame() {
-	return this->decoder->get_audio_frame();
+AVFrame* Track::get_next_audio_frame() {
+	return decoder->get_audio_frame();
 }
 
-AVFrame* Track::get_frame(float secs)
+AVFrame* Track::get_video_frame(float secs)
 {
 	Clip* clip = find_clip_at(secs);
 	if (clip == nullptr)
@@ -618,10 +659,10 @@ AVFrame* Track::get_frame(float secs)
 
 	AVFrame* decoded_frame = decoder->get_video_frame_at(secs - clip->video_start_secs + clip->file_start_secs);
 	if (decoded_frame == nullptr) {
-		Logger::get("get_frame") << "didn't get frame from decoder\n";
+		Logger::get("get_video_frame") << "didn't get frame from decoder\n";
 		return nullptr;
 	} else if (decoded_frame->width == 0) {
-		Logger::get("get_frame") << "got a frame with 0 width\n";
+		Logger::get("get_video_frame") << "got a frame with 0 width\n";
 		return nullptr;
 	}
 
@@ -643,26 +684,26 @@ AVFrame* Track::get_frame(float secs)
 /********
 * Video *
 ********/
-Video::Video()
-	: main_track(this),
-	  overlay_track(this)
+Video::Video() : main_track(this), overlay_track(this)
 {
 }
 
 Video::~Video()
 {
-	if (this->out_frame != nullptr)
-		av_frame_unref(this->out_frame);
+	if (this->out_video_frame != nullptr)
+		av_frame_unref(this->out_video_frame);
+	if (this->out_audio_frame != nullptr)
+		av_frame_unref(this->out_audio_frame);
 }
 
 void Video::addToMainTrack(const std::string& filename, TransitionEffect effect)
 {
-	main_track.add(FilePiece(filename, main_track.get_duration_secs()), effect);
+	main_track.add(FilePiece(filename, this->main_track.get_duration_secs()), effect);
 }
 
 void Video::addToOverlayTrack(const std::string& filename, TransitionEffect effect)
 {
-	overlay_track.add(FilePiece(filename, overlay_track.get_duration_secs()), effect);
+	overlay_track.add(FilePiece(filename, this->overlay_track.get_duration_secs()), effect);
 }
 
 // returns whether the frame will change
@@ -683,10 +724,7 @@ float Video::get_last_video_frame_secs()
 
 int Video::get_video_frame(float secs, int out_width, int out_height)
 {
-	static int iter = -1;
-	++iter;
-
-	AVFrame* main_frame = main_track.get_frame(secs);
+	AVFrame* main_frame = this->main_track.get_video_frame(secs);
 	if (main_frame == nullptr) {
 		// TODO: add status to decoder so we know whether it's got an error or operating normally
 		Logger::get("error") << "xx error getting a video frame from the main track\n";
@@ -694,17 +732,16 @@ int Video::get_video_frame(float secs, int out_width, int out_height)
 	}
 
 	// put overlay track on top
-	AVFrame* overlay_frame = overlay_track.get_frame(secs);
-	overlay_frame = nullptr;
+	AVFrame* overlay_frame = this->overlay_track.get_video_frame(secs);
 	if (overlay_frame != nullptr) {
 		if (this->overlay_track_filter == nullptr)
-			this->overlay_track_filter = Filter::OverlayTrack(main_track.get_decoder(), overlay_track.get_decoder(), out_width, out_height);
+			this->overlay_track_filter = Filter::OverlayTrack(main_track.get_decoder(), this->overlay_track.get_decoder(), out_width, out_height);
 		int ret = this->overlay_track_filter->feed(main_frame, overlay_frame);
 		if (ret != 0) {
 			Logger::get("error") << "error feeding the overlay filter: " << av_err2str(ret) << "\n";
 			return ret;
 		}
-		this->out_frame = this->overlay_track_filter->get_output_frame();
+		this->out_video_frame = this->overlay_track_filter->get_output_frame();
 	} else {
 		if (this->solo_track_filter == nullptr)
 			this->solo_track_filter = Filter::SoloTrack(main_track.get_decoder(), out_width, out_height);
@@ -713,8 +750,44 @@ int Video::get_video_frame(float secs, int out_width, int out_height)
 			Logger::get("error") << "error feeding the overlay filter: " << av_err2str(ret) << "\n";
 			return ret;
 		}
-		this->out_frame = this->solo_track_filter->get_output_frame();
+		this->out_video_frame = this->solo_track_filter->get_output_frame();
 	}
+
+	return 0;
+}
+
+int Video::get_next_audio_frame()
+{
+	AVFrame* main_frame = this->main_track.get_next_audio_frame();
+	if (main_frame == nullptr) {
+		// TODO: add status to decoder so we know whether it's got an error or operating normally
+		Logger::get("error") << "xx error getting an audio frame from the main track\n";
+		return AVERROR(EAGAIN);
+	}
+
+	// put overlay track on top
+	AVFrame* overlay_frame = this->overlay_track.get_next_audio_frame();
+	overlay_frame = nullptr;
+	if (overlay_frame == nullptr) {
+		if (this->audioprep_filter == nullptr)
+			this->audioprep_filter = Filter::AudioPrep(main_track.get_decoder());
+		int ret = this->audioprep_filter->feed(main_frame);
+		if (ret != 0) {
+			Logger::get("error") << "error feeding the overlay filter: " << av_err2str(ret) << "\n";
+			return ret;
+		}
+		this->out_audio_frame = this->audioprep_filter->get_output_frame();
+		return 0;
+	}
+
+	if (this->audiomix_filter == nullptr)
+		this->audiomix_filter = Filter::AudioMix(main_track.get_decoder(), this->overlay_track.get_decoder());
+	int ret = this->audiomix_filter->feed(main_frame, overlay_frame);
+	if (ret != 0) {
+		Logger::get("error") << "error feeding the overlay filter: " << av_err2str(ret) << "\n";
+		return ret;
+	}
+	this->out_audio_frame = this->audiomix_filter->get_output_frame();
 
 	return 0;
 }
