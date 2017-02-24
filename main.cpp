@@ -97,7 +97,7 @@ void load_test_scenario()
 	std::this_thread::sleep_for(std::chrono::milliseconds(10));
 	//seek(1.0f);
 	//video.main_track.split(1, TransitionEffect::Fade);
-	play();
+	//play();
 }
 
 void audio_callback(void*, Uint8 *stream, int len)
@@ -275,7 +275,7 @@ int main(int argc, char* argv[])
 	//Logger::addCategory("realtime");
 	//Logger::addCategory("filter");
 	//Logger::addCategory("decoder");
-	Logger::addCategory("overlay");
+	//Logger::addCategory("overlay");
 
 	// video decoder
 	av_register_all();

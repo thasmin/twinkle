@@ -169,7 +169,7 @@ Filter* Filter::OverlayTrack(const Decoder_Ctx* decoder1, const Decoder_Ctx* dec
 	filter_str << "[overlayed] format=pix_fmts=rgb24 [result];";
 	filter_str << sink_str;
 
-	Logger::get("overlay") << filter_str.str() << "\n";
+	Logger::get("overlay") << "overlay video filter: " << filter_str.str() << "\n";
 	return new Filter(FilterEffect::OverlayTrack, filter_str.str());
 }
 
@@ -182,12 +182,13 @@ Filter* Filter::AudioMix(const Decoder_Ctx* decoder1, const Decoder_Ctx* decoder
 	std::stringstream filter_str;
 	filter_str << buffer1_str;
 	filter_str << buffer2_str;
-	filter_str << "[in_1] aresample=osr=44100:ocl=stereo:osf=s16 [r1];";
-	filter_str << "[in_2] aresample=osr=44100:ocl=stereo:osf=s16 [r2];";
-	filter_str << "[r2] [r1] amix=inputs=2 [mixed];";
+	filter_str << "[in_1] volume=0.8 [v1];";
+	filter_str << "[in_2] volume=2.5 [v2];";
+	filter_str << "[v1] [v2] amix [mixed];";
 	filter_str << "[mixed] aresample=osr=44100:ocl=stereo:osf=s16 [result];";
 	filter_str << sink_str;
 
+	Logger::get("overlay") << "audiomix filter: " << filter_str.str() << "\n";
 	return new Filter(FilterEffect::AudioMix, filter_str.str());
 }
 
@@ -199,11 +200,9 @@ Filter* Filter::AudioPrep(const Decoder_Ctx* decoder)
 	std::stringstream filter_str;
 	filter_str << buffer1_str;
 	filter_str << "[in_1] aresample=osr=44100:ocl=stereo:osf=s16 [result];";
-	//filter_str << "[in_1] aformat=sample_fmts=s16:sample_rates=44100:channel_layouts=3 [result];";
-	//filter_str << "[in_1] anull [result];";
 	filter_str << sink_str;
 
-	Logger::get("overlay") << filter_str.str() << "\n";
+	Logger::get("overlay") << "audioprep filter: " << filter_str.str() << "\n";
 	return new Filter(FilterEffect::AudioPrep, filter_str.str());
 }
 
@@ -767,7 +766,6 @@ int Video::get_next_audio_frame()
 
 	// put overlay track on top
 	AVFrame* overlay_frame = this->overlay_track.get_next_audio_frame();
-	overlay_frame = nullptr;
 	if (overlay_frame == nullptr) {
 		if (this->audioprep_filter == nullptr)
 			this->audioprep_filter = Filter::AudioPrep(main_track.get_decoder());
