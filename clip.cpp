@@ -163,8 +163,8 @@ Filter* Filter::OverlayTrack(const Decoder_Ctx* decoder1, const Decoder_Ctx* dec
 	filter_str << buffer1_str;
 	filter_str << buffer2_str;
 	filter_str << "[in_1] scale=w=" << out_width << ":h=" << out_height << " [scaled];";
-	filter_str << "[scaled] drawbox=x=9:y=9:w=52:h=52:c=red:t=3 [boxed];";
-	filter_str << "[in_2] scale=w=50:h=50 [overlay];";
+	filter_str << "[scaled] drawbox=x=9:y=9:w=102:h=102:c=red:t=3 [boxed];";
+	filter_str << "[in_2] scale=w=100:h=100 [overlay];";
 	filter_str << "[boxed] [overlay] overlay=x=10:y=10 [overlayed];";
 	filter_str << "[overlayed] format=pix_fmts=rgb24 [result];";
 	filter_str << sink_str;
@@ -713,7 +713,7 @@ bool Video::seek(float secs)
 
 float Video::get_duration_secs()
 {
-	return this->main_track.get_duration_secs();
+	return std::max(this->main_track.get_duration_secs(), this->overlay_track.get_duration_secs());
 }
 
 float Video::get_last_video_frame_secs()

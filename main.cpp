@@ -43,6 +43,32 @@ extern "C"
 
 typedef std::chrono::high_resolution_clock timer_clock;
 
+// color scheme from https://flatuicolors.com/
+struct nk_color fill_colors[] = {
+	nk_rgb(192, 57, 43),
+	nk_rgb(211, 84, 0),
+	nk_rgb(243, 156, 18),
+	nk_rgb(39, 174, 96),
+	nk_rgb(41, 128, 185),
+	nk_rgb(142, 68, 173),
+	nk_rgb(44, 62, 80),
+	nk_rgb(127, 140, 141),
+	nk_rgb(189, 195, 199),
+};
+struct nk_color line_colors[] = {
+	nk_rgb(231, 76, 60),
+	nk_rgb(230, 126, 34),
+	nk_rgb(241, 196, 15),
+	nk_rgb(46, 204, 113),
+	nk_rgb(52, 152, 219),
+	nk_rgb(155, 89, 182),
+	nk_rgb(52, 73, 94),
+	nk_rgb(149, 165, 166),
+	nk_rgb(236, 240, 241),
+};
+
+
+int win_width, win_height;
 bool paused = true;
 bool just_seeked = true;
 float last_frame_secs = 0;
@@ -168,9 +194,18 @@ void open_audio()
 	Logger::get("audio") << "received sample rate " << audio_spec.freq << ", " << (char)(audio_spec.channels + '0') << " channels, format " << audio_spec.format << "\n";
 }
 
-void widget_clips_bar(struct nk_context *ctx)
+void v_draw_text(struct nk_command_buffer* canvas, const char* text, const struct nk_user_font* font, int x, int y, nk_color bg_color, nk_color fg_color)
 {
-	struct nk_command_buffer *canvas = nk_window_get_canvas(ctx);
+	int text_len = strlen(text);
+	int width = font->width(font->userdata, font->height, text, text_len);
+	struct nk_rect rect = nk_rect(x, y, width, font->height);
+	nk_draw_text(canvas, rect, text, text_len, font, bg_color, fg_color);
+}
+
+void widget_tracks(struct nk_context* ctx)
+{
+	struct nk_command_buffer* canvas = nk_window_get_canvas(ctx);
+	const struct nk_user_font* def_font = ctx->style.font;
 
 	struct nk_rect space;
 	enum nk_widget_layout_states widget_state = nk_widget(&space, ctx);
@@ -203,31 +238,62 @@ void widget_clips_bar(struct nk_context *ctx)
 		nk_rgb(236, 240, 241),
 	};
 
-	int max_height = 28;
+	// height: main track (30) + padding (5) + overlay track (30) + padding(5) + lines (10)
+
+	int volume_width = 50;
+	int bars_start_x = space.x + volume_width;
+	int bars_width = space.w - volume_width;
+
+	// draw main track volume
+	int top = space.y;
+	int track_height = 28;
+	v_draw_text(canvas, "100", def_font, space.x + 5, top + (30/2) - 0.5f * def_font->height, nk_rgba(0,0,0,0), nk_rgb(255,200,200));
+
+	// draw main track
 	int color_num = 0;
-	for (auto piece_it = video.main_track.pieces.begin(); piece_it != video.main_track.pieces.end(); ++piece_it) {
-		float start = space.w * piece_it->file.video_start_secs / video_duration + 1; // add 1 for line thickness
-		float width = space.w * piece_it->file.duration_secs / video_duration - 10; // dunno why need to subtract 9
-		float height = max_height < space.h ? max_height : space.h;
-		struct nk_rect size = nk_rect(space.x + start, space.y + 1, space.x + width, height);
+	for (auto piece = video.main_track.pieces.begin(); piece != video.main_track.pieces.end(); ++piece) {
+		float start = bars_width * piece->file.video_start_secs / video_duration + 1; // add 1 for line thickness
+		float width = bars_width * piece->file.duration_secs / video_duration - 10; // dunno why need to subtract 9
+		struct nk_rect size = nk_rect(bars_start_x + start, top + 1, bars_start_x + width, track_height);
 		nk_fill_rect(canvas, size, 2, fill_colors[color_num]);
 		nk_stroke_rect(canvas, size, 2, 3, line_colors[color_num]);
 		color_num += 1;
+		//Logger::get("ui") << "main track piece from " << piece->file.video_start_secs << " to " << piece->file.video_start_secs + piece->file.duration_secs << "\n";
 	}
+
+	// write main track title
+	v_draw_text(canvas, "main", def_font, bars_start_x + 10, top + (30/2) - 0.5f * def_font->height, nk_rgba(0,0,0,0), nk_rgb(200,200,200));
+
+	// draw overlay track
+	top += track_height + 5;
+	color_num += 1;
+	for (auto piece = video.overlay_track.pieces.begin(); piece != video.overlay_track.pieces.end(); ++piece) {
+		float start = bars_width * piece->file.video_start_secs / video_duration + 1; // add 1 for line thickness
+		float width = bars_width * piece->file.duration_secs / video_duration - 10; // dunno why need to subtract 9
+		struct nk_rect size = nk_rect(bars_start_x + start, top + 1, bars_start_x + width, track_height);
+		nk_fill_rect(canvas, size, 2, fill_colors[color_num]);
+		nk_stroke_rect(canvas, size, 2, 3, line_colors[color_num]);
+		color_num += 1;
+		//Logger::get("ui") << "overlay track piece from " << piece->file.video_start_secs << " to " << piece->file.video_start_secs + piece->file.duration_secs << "\n";
+	}
+
+	// write main track title
+	int overlay_title_width = def_font->width(def_font->userdata, def_font->height, "overlay", 7);
+	struct nk_rect overlay_title_rect = nk_rect(bars_start_x + 10, top + (30/2) - 0.5f * def_font->height, overlay_title_width, def_font->height);
+	nk_draw_text(canvas, overlay_title_rect, "overlay", 7, def_font, nk_rgba(0,0,0,0), nk_rgb(200,200,200));
 
 	// draw marks for each second
 	for (int i = 0; i < video_duration; ++i) {
-		struct nk_rect mark = nk_rect(space.x + space.w * i / video_duration, space.y + space.h - 10, 1, 10);
+		struct nk_rect mark = nk_rect(bars_start_x + bars_width * i / video_duration, space.y + space.h - 10, 1, 10);
 		nk_stroke_rect(canvas, mark, 0, 1, nk_rgb(200,200,200));
 	}
 
 	// draw full time
 	char time[10];
 	int timelen = snprintf(time, 10, "%ds", (int) video_duration);
-	const struct nk_user_font* def_font = ctx->style.font;
-	int width = def_font->width(def_font->userdata, def_font->height, time, timelen);
 	int height = def_font->height;
-	struct nk_rect time_rect = nk_rect(space.x + space.w - width, space.y + space.h - height, width, height);
+	int width = def_font->width(def_font->userdata, height, time, timelen);
+	struct nk_rect time_rect = nk_rect(bars_start_x + bars_width - width, space.y + space.h - height, width, height);
 	nk_draw_text(canvas, time_rect, time, timelen, def_font, nk_black, nk_rgb(200,200,200));
 
 	float mouse_x = ctx->input.mouse.pos.x;
@@ -238,19 +304,19 @@ void widget_clips_bar(struct nk_context *ctx)
 
 	// draw selection vertical line
 	if (clips_bar_last_click_secs != -1) {
-		int selection_x = space.x + space.w * clips_bar_last_click_secs / video_duration;
+		int selection_x = bars_start_x + bars_width * clips_bar_last_click_secs / video_duration;
 		nk_stroke_line(canvas, selection_x, space.y, selection_x, space.y + space.h, 3, nk_rgb(100, 100, 200));
 	}
 
 	// draw current place indicator
-	int current_x = space.x + space.w * video.get_last_video_frame_secs() / video_duration;
+	int current_x = bars_start_x + bars_width * video.get_last_video_frame_secs() / video_duration;
 	nk_stroke_line(canvas, current_x, space.y, current_x, space.y + space.h, 1, nk_rgb(100,100,100));
 
 	// handle seeks via click or drag
 	if (widget_state != NK_WIDGET_ROM) {
 		if (nk_input_has_mouse_click_down_in_rect(&ctx->input, NK_BUTTON_LEFT, space, nk_true)) {
 			float mouse_x = ctx->input.mouse.pos.x;
-			float mouse_x_pct = (mouse_x - space.x) / space.w;
+			float mouse_x_pct = (mouse_x - bars_start_x) / bars_width;
 			float seek_secs = mouse_x_pct * video_duration;
 
 			if (just_seeked || last_seek_secs != seek_secs) {
@@ -265,6 +331,135 @@ void widget_clips_bar(struct nk_context *ctx)
 	//nk_stroke_rect(canvas, space, 0, 1, nk_rgb(200,200,200));
 }
 
+void widget_track(struct nk_context* ctx, Track* track, int color_num)
+{
+	struct nk_command_buffer* canvas = nk_window_get_canvas(ctx);
+
+	struct nk_rect space;
+	enum nk_widget_layout_states widget_state = nk_widget(&space, ctx);
+	if (!widget_state)
+		return;
+
+	float video_duration = video.get_duration_secs();
+
+	for (auto piece = track->pieces.begin(); piece != track->pieces.end(); ++piece) {
+		float start = space.w * piece->file.video_start_secs / video_duration - 3; // add 1 for line thickness
+		float width = space.w * piece->file.duration_secs / video_duration; // dunno why need to subtract 9
+		struct nk_rect size = nk_rect(space.x + start, space.y + 1, space.x + width, space.h - 2);
+		nk_fill_rect(canvas, size, 2, fill_colors[color_num]);
+		nk_stroke_rect(canvas, size, 2, 3, line_colors[color_num]);
+		//Logger::get("ui") << "main track piece from " << piece->file.video_start_secs << " to " << piece->file.video_start_secs + piece->file.duration_secs << "\n";
+	}
+
+	// write main track title
+	const char* title = track == &video.main_track ? "main" : "overlay";
+	v_draw_text(canvas, title, ctx->style.font, space.x + 10, space.y + (30/2) - 0.5f * ctx->style.font->height, nk_rgba(0,0,0,0), nk_rgb(200,200,200));
+}
+
+void widget_timemarks(struct nk_context* ctx)
+{
+	struct nk_command_buffer* canvas = nk_window_get_canvas(ctx);
+
+	struct nk_rect space;
+	enum nk_widget_layout_states widget_state = nk_widget(&space, ctx);
+	if (!widget_state)
+		return;
+
+	float video_duration = video.get_duration_secs();
+
+	// draw marks for each second
+	for (int i = 0; i < video_duration; ++i) {
+		struct nk_rect mark = nk_rect(space.x + space.w * i / video_duration, space.y + space.h - 10, 1, 10);
+		nk_stroke_rect(canvas, mark, 0, 1, nk_rgb(200,200,200));
+	}
+
+	// draw full time
+	char time[10];
+	int timelen = snprintf(time, 10, "%ds", (int) video_duration);
+	const struct nk_user_font* font = ctx->style.font;
+	int height = font->height;
+	int width = font->width(font->userdata, height, time, timelen);
+	struct nk_rect time_rect = nk_rect(space.x + space.w - width, space.y + space.h - height, width, height);
+	nk_draw_text(canvas, time_rect, time, timelen, font, nk_black, nk_rgb(200,200,200));
+}
+
+void widget_clips_overlay(struct nk_context* ctx, const struct nk_rect track_rect)
+{
+	struct nk_command_buffer* canvas = nk_window_get_canvas(ctx);
+	nk_stroke_rect(canvas, track_rect, 0, 1, nk_rgb(255, 0, 0));
+
+	float video_duration = video.get_duration_secs();
+
+	// draw selection vertical line
+	if (clips_bar_last_click_secs != -1) {
+		int selection_x = track_rect.x + track_rect.w * clips_bar_last_click_secs / video_duration;
+		nk_stroke_line(canvas, selection_x, track_rect.y, selection_x, track_rect.y + track_rect.h, 3, nk_rgb(100, 100, 200));
+	}
+
+	// draw current place indicator
+	int current_x = track_rect.x + track_rect.w * video.get_last_video_frame_secs() / video_duration;
+	nk_stroke_line(canvas, current_x, track_rect.y, current_x, track_rect.y + track_rect.h, 1, nk_rgb(100,100,100));
+
+	float mouse_x = ctx->input.mouse.pos.x;
+	// draw hover vertical line
+	if (nk_input_is_mouse_hovering_rect(&ctx->input, track_rect))
+		nk_stroke_line(canvas, mouse_x, track_rect.y, mouse_x, track_rect.y + track_rect.h, 1, nk_rgb(200,200,200));
+
+	// handle seeks via click or drag
+	if (nk_input_has_mouse_click_down_in_rect(&ctx->input, NK_BUTTON_LEFT, track_rect, nk_true)) {
+		float mouse_x_pct = (mouse_x - track_rect.x) / track_rect.w;
+		// TODO: make track pixel perfect so this is unnecessary
+		if (mouse_x_pct > 1)
+			mouse_x_pct = 1;
+		float seek_secs = mouse_x_pct * video_duration;
+		Logger::get("ui") << "at " << mouse_x_pct << "%, seeking to " << seek_secs << "s\n";
+
+		if (just_seeked || last_seek_secs != seek_secs) {
+			seek(seek_secs);
+			last_seek_secs = seek_secs;
+			clips_bar_last_click_secs = seek_secs;
+		}
+	}
+}
+
+int main_volume = 100;
+int overlay_volume = 100;
+void widget_clips_bar(struct nk_context* ctx)
+{
+	struct nk_rect empty;
+
+	int volume_width = 100;
+	int track_width = win_width - volume_width - 30;
+
+	// draw main track
+	nk_layout_row_begin(ctx, NK_STATIC, 30, 2);
+	int start_y = ctx->current->layout->at_y;
+	nk_layout_row_push(ctx, volume_width);
+	nk_property_int(ctx, "#vol", 0, &main_volume, 200, 1, 1);
+	nk_layout_row_push(ctx, track_width);
+	widget_track(ctx, &video.main_track, 0);
+	nk_layout_row_end(ctx);
+
+	// draw overlay track
+	nk_layout_row_begin(ctx, NK_STATIC, 30, 2);
+	nk_layout_row_push(ctx, volume_width);
+	nk_property_int(ctx, "#vol", 0, &overlay_volume, 200, 1, 1);
+	nk_layout_row_push(ctx, track_width);
+	widget_track(ctx, &video.overlay_track, 1);
+	nk_layout_row_end(ctx);
+
+	// draw timemarks
+	nk_layout_row_begin(ctx, NK_STATIC, 15, 2);
+	nk_layout_row_push(ctx, volume_width);
+	nk_widget(&empty, ctx);
+	nk_layout_row_push(ctx, track_width);
+	widget_timemarks(ctx);
+	nk_layout_row_end(ctx);
+
+	struct nk_rect track_rect = nk_rect(8 + volume_width, start_y, track_width, 75 + 10);
+	widget_clips_overlay(ctx, track_rect);
+}
+
 int main(int argc, char* argv[])
 {
 	Logger::addCategory("error");
@@ -276,6 +471,7 @@ int main(int argc, char* argv[])
 	//Logger::addCategory("filter");
 	//Logger::addCategory("decoder");
 	//Logger::addCategory("overlay");
+	Logger::addCategory("ui");
 
 	// video decoder
 	av_register_all();
@@ -285,7 +481,6 @@ int main(int argc, char* argv[])
     SDL_Window *win;
     SDL_GLContext glContext;
     struct nk_color background;
-    int win_width, win_height;
 
     // GUI
     struct nk_context *ctx;
@@ -318,8 +513,8 @@ int main(int argc, char* argv[])
     nk_sdl_font_stash_begin(&atlas);
     nk_sdl_font_stash_end();
 
-	int video_w = 256;
-	int video_h = 256;
+	int video_w = 384;
+	int video_h = 384;
 
 	glEnable(GL_TEXTURE_2D);
 	GLuint frame_texture;
@@ -441,7 +636,6 @@ int main(int argc, char* argv[])
 			nk_image(ctx, frame_image);
 			nk_layout_row_end(ctx);
 
-			nk_layout_row_dynamic(ctx, 50, 1);
 			widget_clips_bar(ctx);
         }
         nk_end(ctx);
